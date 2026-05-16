@@ -13,7 +13,12 @@ public record SetupContext(
         Path stateDir,
         Path binDir,
         boolean verify,
-        boolean force) {
+        boolean force,
+        String directorIp,
+        String internalCidr) {
+
+    public static final String DEFAULT_DIRECTOR_IP = "10.245.0.11";
+    public static final String DEFAULT_INTERNAL_CIDR = "10.245.0.0/24";
 
     private static final DateTimeFormatter LOG_TS = DateTimeFormatter
             .ofPattern("yyyyMMdd-HHmmss")

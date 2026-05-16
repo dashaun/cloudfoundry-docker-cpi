@@ -77,7 +77,8 @@ public class SetupCommands {
         Path home = Paths.get(System.getProperty("user.home"));
         Path stateDir = home.resolve(".cf-docker-cpi").resolve("hosts").resolve(slug);
         Path binDir = home.resolve(".cf-docker-cpi").resolve("bin");
-        return new SetupContext(target, slug, stateDir, binDir, verify, force);
+        return new SetupContext(target, slug, stateDir, binDir, verify, force,
+                SetupContext.DEFAULT_DIRECTOR_IP, SetupContext.DEFAULT_INTERNAL_CIDR);
     }
 
     private String renderResult(SetupContext ctx, String name, StepResult result) {
