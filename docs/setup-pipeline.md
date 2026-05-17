@@ -48,14 +48,44 @@ Write `director-vars.yml` with director IP, internal CIDR, and the runtime docke
 
 `bosh create-env` the BOSH director. ~5 min on first run.
 
-- **Inputs**: `bosh-deployment/bosh.yml`, `bosh-deployment/docker/cpi.yml`, `bosh-deployment/jumpbox-user.yml`, `director-vars.yml`.
+- **Inputs**: `bosh-deployment/bosh.yml`, `bosh-deployment/docker/cpi.yml`, `bosh-deployment/jumpbox-user.yml`, `director-vars.yml`, plus an inlined `docker-cpi-overrides.yml` ops file.
 - **Outputs**: `director-state.json` (contains VM CID), `director-creds.yml` (admin password, mTLS certs, jumpbox SSH key).
 - **Cheap check**: `director-state.json` exists with a non-empty `current_vm_cid` and matches the recorded `current_manifest_sha`.
 - **Deep check**: `bosh env -e <slug>` succeeds against the director IP through the tunnel.
 - **Failure modes**:
   - State file present but director container gone (CPI lost it) → suggest `setup reset --step deploy-director`.
   - Container resource limits insufficient → bosh CLI emits a clear error.
-  - CPI can't reach docker socket → check the tunnel; SSH stderr in the step log.
+  - CPI can't reach docker → check `tls/` on the host and dockerd's TLS config (below).
+  - Bootstrap exits 78 with `tls/ca.pem missing` → see "dockerd TLS prereq" below.
+
+### dockerd TLS prereq
+
+The director container runs on a dedicated `cf-docker-cpi-net` bridge (gateway `10.245.0.1`). The in-container CPI talks to dockerd over **TLS-on-TCP at `tcp://10.245.0.1:2376`**. This is non-negotiable:
+
+- bosh-docker-cpi 0.2.12's `cpi.json.erb` reads `p('docker_cpi.docker.tls.ca')` unconditionally; whenever a `tls` block is rendered the Go docker client uses HTTPS regardless of the URL scheme. Plain `tcp://` with dummy certs fails with `http: server gave HTTP response to HTTPS client`.
+- Bind-mounting `/var/run/docker.sock` into the director also fails because `/var/run` is a tmpfs in the noble stemcell.
+
+So dockerd must be reconfigured (one-time per host):
+
+```bash
+sudo install -d -m 0755 /etc/docker/tls
+sudo install -m 0444 -o root -g root <CA + server cert/key, signed s.t. SAN includes 10.245.0.1> /etc/docker/tls/
+sudo tee /etc/systemd/system/docker.service.d/tcp-listen.conf >/dev/null <<'DROPIN'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/dockerd \
+  -H fd:// \
+  -H tcp://0.0.0.0:2376 \
+  --tlsverify \
+  --tlscacert=/etc/docker/tls/ca.pem \
+  --tlscert=/etc/docker/tls/server-cert.pem \
+  --tlskey=/etc/docker/tls/server-key.pem \
+  --containerd=/run/containerd/containerd.sock
+DROPIN
+sudo systemctl daemon-reload && sudo systemctl restart docker
+```
+
+`deploy-director` then requires a matching CA + client cert/key triple at `~/.cf-docker-cpi-work/tls/{ca,client-cert,client-key}.pem` on the docker host. They are injected into the BOSH ops file via `bosh create-env --var-file cf_docker_cpi_tls_{ca,cert,key}=tls/...`. There is no automated step that generates these certs yet — see the bootstrap precheck in `DeployDirectorStep`. The `cloud_provider` (host-side) CPI keeps `unix:///var/run/docker.sock` and an auto-generated dummy TLS block; unix:// never negotiates TLS so the dummy values are inert.
 
 ## 6. `login-director`
 
@@ -71,11 +101,11 @@ Write `director-vars.yml` with director IP, internal CIDR, and the runtime docke
 
 `bosh upload-stemcell` for the pinned warden stemcell version.
 
-- **Inputs**: stemcell URL (`https://bosh.io/d/stemcells/bosh-warden-boshlite-ubuntu-jammy-go_agent?v=<version>`), pinned in code.
+- **Inputs**: stemcell URL pinned in `ManifestVersions` (currently `bosh-warden-boshlite-ubuntu-noble` @ 1.364, fetched directly from `storage.googleapis.com/bosh-core-stemcells/` because bosh.io's `?v=` redirect for the noble line is unreliable). The version is the one cf-deployment `v56.4.0` expects.
 - **Outputs**: stemcell present on director.
 - **Cheap check**: status file says PASS in this director state.
 - **Deep check**: `bosh stemcells` lists the pinned name+version.
-- **Failure modes**: bosh.io transient unavailability; director out of disk — surfaced by bosh.
+- **Failure modes**: GCS transient unavailability; director out of disk — surfaced by bosh. CPI-to-dockerd connectivity issues surface here because this is the first step that actually exercises the in-container CPI (`create_stemcell` POSTs the image to dockerd) — if you see TLS/HTTPS errors, revisit §5's dockerd TLS prereq.
 
 ## 8. `update-cloud-config`
 
