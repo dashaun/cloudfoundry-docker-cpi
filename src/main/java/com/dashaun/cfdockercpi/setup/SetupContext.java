@@ -17,8 +17,10 @@ public record SetupContext(
         String directorIp,
         String internalCidr) {
 
+    public static final String DEFAULT_DIRECTOR_NAME = "cf-docker-cpi";
     public static final String DEFAULT_DIRECTOR_IP = "10.245.0.11";
     public static final String DEFAULT_INTERNAL_CIDR = "10.245.0.0/24";
+    public static final String DEFAULT_INTERNAL_GW = "10.245.0.1";
 
     private static final DateTimeFormatter LOG_TS = DateTimeFormatter
             .ofPattern("yyyyMMdd-HHmmss")
