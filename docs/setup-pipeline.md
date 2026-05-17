@@ -111,11 +111,11 @@ sudo systemctl daemon-reload && sudo systemctl restart docker
 
 `bosh update-cloud-config` with `cf-deployment/iaas-support/bosh-lite/cloud-config.yml`.
 
-- **Inputs**: the cloud-config YAML from the cloned cf-deployment.
-- **Outputs**: cloud-config in the director.
-- **Cheap check**: SHA of the local file matches the SHA recorded in `status.json`.
-- **Deep check**: `bosh cloud-config` output's SHA matches the local file.
-- **Failure modes**: director not logged in (step 6 regressed); YAML syntax error in cf-deployment (upstream issue).
+- **Inputs**: the cloud-config YAML from the locally-cloned cf-deployment (`<state-dir>/cf-deployment/iaas-support/bosh-lite/cloud-config.yml`). The file is `scp`'d to `~/.cf-docker-cpi-work/cloud-config.yml` on the docker host on every run.
+- **Outputs**: cloud-config in the director; no new local file. `status.json` records `file_sha=<8> applied_sha=<8>` — the SHA of the source file we sent, and the SHA of what `bosh cloud-config` returns from the director after apply.
+- **Cheap check**: status PASS exists AND the current local file's SHA matches the recorded `file_sha`. If the cf-deployment pin moves (different SHA), the step is re-run.
+- **Deep check** (`--verify`): cheap check passes AND `bosh -e <slug> cloud-config | sha256sum` on the remote matches the recorded `applied_sha`. Catches director-side drift (manual edits, lost state).
+- **Failure modes**: director not logged in (step 6 regressed); YAML syntax error in cf-deployment (upstream issue); `bosh cloud-config` returns the empty/none response after a successful apply (director persistence bug — surfaces as missing `applied_sha` in the run output).
 
 ## 9. `deploy-cf`
 
