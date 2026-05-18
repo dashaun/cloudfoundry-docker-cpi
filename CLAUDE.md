@@ -66,6 +66,13 @@ The BOSH director container runs on a dedicated `cf-docker-cpi-net` bridge with 
 
 So dockerd is reconfigured one-time per host with `--tlsverify -H tcp://0.0.0.0:2376` and a CA/server cert/key under `/etc/docker/tls/`. `DeployDirectorStep` reads a matching CA + client cert/key from `~/.cf-docker-cpi-work/tls/` on the docker host (precheck exits 78 if missing) and injects them into the BOSH ops file via `bosh create-env --var-file cf_docker_cpi_tls_{ca,cert,key}=tls/...`. `cloud_provider` (the host-side CPI invoked directly by `bosh create-env`) keeps `unix:///var/run/docker.sock` and an auto-generated dummy TLS block — unix:// never negotiates TLS, so the dummy values are inert. See `docs/setup-pipeline.md §6` for the full dockerd recipe.
 
+### Setup pipeline: dns-wait pre-start hook on diego-cell (the fourth big one)
+`UpdateRuntimeConfigStep` applies two named runtime-configs: the upstream `dns` (bosh-dns addon) and a `dns-wait` addon scoped to the `diego-cell` instance group. The `dns-wait` addon co-locates a tiny in-repo BOSH release (`cf-docker-cpi-dns-wait/0.1.0`) whose single `wait-for-locket-dns` job is a pre-start-only hook that polls `getent hosts locket.service.cf.internal` until success (5 min timeout, then fails the VM).
+
+Issue #16: on noble docker stemcells `systemd-resolved → bosh-dns` forwarding races bosh-dns coming up on the local cell VM. Without the wait, `rep` panics in `initializeCellPresence` (`failed-to-construct-locket-client`, context deadline exceeded) before the resolver settles. 14/15 cf-deployment instance groups happen to win this race; `diego-cell` consistently loses it.
+
+The release source is materialised inline in `UpdateRuntimeConfigStep.java` (no tarball checked into the repo). The step shells out to `bosh create-release --tarball` + `bosh upload-release` on the docker host, guarded by a `bosh releases | awk` idempotency check. **If the pre-start script changes, bump `DNS_WAIT_RELEASE_VERSION`** — `bosh upload-release` refuses to replace existing version contents. See `docs/setup-pipeline.md §10` for the rationale (a previous attempt at `configure_systemd_resolved: false` + `override_nameserver: true` failed because `/etc/resolv.conf` is a symlink owned by systemd-resolved on noble).
+
 ## Layout
 
 - `com.dashaun.cfdockercpi.commands` — Spring Shell command classes.

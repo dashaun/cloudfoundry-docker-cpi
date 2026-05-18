@@ -135,13 +135,25 @@ sudo systemctl daemon-reload && sudo systemctl restart docker
 
 ## 10. `update-runtime-config`
 
-`bosh update-runtime-config bosh-deployment/runtime-configs/dns.yml --name dns` so bosh-dns is added as an addon on every VM in every deployment. Without this, `route_registrar` (and anything else resolving `*.service.cf.internal`) crashes during `deploy-cf` with `dial tcp: lookup nats.service.cf.internal on 127.0.0.53:53: server misbehaving`.
+Applies **two** named runtime-configs to the director:
 
-- **Inputs**: `bosh-deployment/runtime-configs/dns.yml` from the remote `~/.cf-docker-cpi-work/` clone (deploy-director already put it there).
-- **Outputs**: runtime-config registered on the director under the name `dns`. `status.json` records `applied_sha=<8>`.
-- **Cheap check**: status PASS exists.
-- **Deep check** (`--verify`): `bosh runtime-config --name dns | sha256sum` on the remote matches the recorded `applied_sha`.
-- **Failure modes**: director not logged in (step 7 regressed); `dns.yml` missing from the remote clone (deploy-director didn't run); director lacks a config server, e.g., UAA/CredHub were dropped from deploy-director — in that case `bosh update-runtime-config` fails with `Failed to generate variable '/dns_healthcheck_tls_ca' from config server`.
+1. `bosh update-runtime-config bosh-deployment/runtime-configs/dns.yml --name dns` — the upstream bosh-dns addon. Without this, `route_registrar` (and anything else resolving `*.service.cf.internal`) crashes during `deploy-cf` with `dial tcp: lookup nats.service.cf.internal on 127.0.0.53:53: server misbehaving`.
+2. `bosh update-runtime-config dns-wait-runtime-config.yml --name dns-wait` — a tiny in-repo BOSH release (`cf-docker-cpi-dns-wait/0.1.0`) co-located via an addon on the `diego-cell` instance group. Its single job `wait-for-locket-dns` is a pre-start-only hook that polls `getent hosts locket.service.cf.internal` until success (or fails after 5 min). See issue #16: on noble docker stemcells, `systemd-resolved → bosh-dns` forwarding races bosh-dns coming up on the local cell VM; `rep` panics in `initializeCellPresence` with `failed-to-construct-locket-client / context deadline exceeded` before the resolver settles. Holding the VM in pre-start until libc can resolve `locket` lets bosh-dns finish settling on that VM.
+
+The dns-wait release source is materialised on the docker host inside the step (no separate tarball checked into the repo). The step `bosh create-release --tarball`'s it and `bosh upload-release`'s it, skipping both if `bosh releases` already lists `cf-docker-cpi-dns-wait/0.1.0`. Bump `DNS_WAIT_RELEASE_VERSION` in `UpdateRuntimeConfigStep.java` if the pre-start script changes.
+
+- **Inputs**: `bosh-deployment/runtime-configs/dns.yml` from the remote `~/.cf-docker-cpi-work/` clone (deploy-director already put it there); the inline release source written by the step under `~/.cf-docker-cpi-work/dns-wait-release/`.
+- **Outputs**: two runtime-configs registered on the director (`dns`, `dns-wait`) and the `cf-docker-cpi-dns-wait` release uploaded. `status.json` records `dns_sha=<8> dns_wait_sha=<8>`.
+- **Cheap check**: status PASS exists and detail contains both `dns_sha=` and `dns_wait_sha=`.
+- **Deep check** (`--verify`): both `bosh runtime-config --name dns | sha256sum` and `bosh runtime-config --name dns-wait | sha256sum` on the remote match the recorded SHAs.
+- **Failure modes**:
+  - Director not logged in (step 7 regressed); `dns.yml` missing from the remote clone (deploy-director didn't run).
+  - Director lacks a config server, e.g., UAA/CredHub were dropped from deploy-director — `bosh update-runtime-config` fails with `Failed to generate variable '/dns_healthcheck_tls_ca' from config server`.
+  - `bosh create-release` / `bosh upload-release` failures for `cf-docker-cpi-dns-wait` — surfaced verbatim in the step log.
+
+### Why a custom BOSH release for one bash pre-start
+
+Background in issue #16. We tried `configure_systemd_resolved: false` + `override_nameserver: true` first; that fails universally on noble because `/etc/resolv.conf` is a symlink owned by systemd-resolved and bosh-dns's `override_nameserver` writes through the symlink only to have systemd-resolved rewrite it back. A BOSH addon co-located on `diego-cell` is the smallest unit BOSH offers for "run a pre-start on a specific instance group" — there's no in-manifest hook for raw shell. The release has zero packages, one job, one template; `bosh create-release --force --name ... --version ... --tarball ...` builds it locally from inline files in roughly two seconds. If the wait fails after 5 min, the VM goes `failing` with the failure clearly logged in `/var/vcap/sys/log/wait-for-locket-dns/pre-start.log` rather than the user seeing a confusing rep crash.
 
 ## 11. `deploy-cf`
 
