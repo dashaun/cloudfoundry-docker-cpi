@@ -64,7 +64,7 @@ Write `director-vars.yml` with director IP, internal CIDR, and the runtime docke
 
 `bosh create-env` the BOSH director. ~5 min on first run.
 
-- **Inputs**: `bosh-deployment/bosh.yml`, `bosh-deployment/docker/cpi.yml`, `bosh-deployment/jumpbox-user.yml`, `director-vars.yml`, plus an inlined `docker-cpi-overrides.yml` ops file.
+- **Inputs**: `bosh-deployment/bosh.yml`, `bosh-deployment/docker/cpi.yml`, `bosh-deployment/jumpbox-user.yml`, `bosh-deployment/uaa.yml`, `bosh-deployment/credhub.yml`, `director-vars.yml`, plus an inlined `docker-cpi-overrides.yml` ops file. UAA + CredHub are colocated on the director so the director has a built-in config server — required for generating the `/-prefixed` shared variables that the `dns` runtime-config defines (see §10).
 - **Outputs**: `director-state.json` (contains VM CID), `director-creds.yml` (admin password, mTLS certs, jumpbox SSH key).
 - **Cheap check**: `director-state.json` exists with a non-empty `current_vm_cid` and matches the recorded `current_manifest_sha`.
 - **Deep check**: `bosh env -e <slug>` succeeds against the director IP through the tunnel.
@@ -133,7 +133,17 @@ sudo systemctl daemon-reload && sudo systemctl restart docker
 - **Deep check** (`--verify`): cheap check passes AND `bosh -e <slug> cloud-config | sha256sum` on the remote matches the recorded `applied_sha`. Catches director-side drift (manual edits, lost state).
 - **Failure modes**: director not logged in (step 7 regressed); YAML syntax error in cf-deployment (upstream issue); `bosh cloud-config` returns the empty/none response after a successful apply (director persistence bug — surfaces as missing `applied_sha` in the run output).
 
-## 10. `deploy-cf`
+## 10. `update-runtime-config`
+
+`bosh update-runtime-config bosh-deployment/runtime-configs/dns.yml --name dns` so bosh-dns is added as an addon on every VM in every deployment. Without this, `route_registrar` (and anything else resolving `*.service.cf.internal`) crashes during `deploy-cf` with `dial tcp: lookup nats.service.cf.internal on 127.0.0.53:53: server misbehaving`.
+
+- **Inputs**: `bosh-deployment/runtime-configs/dns.yml` from the remote `~/.cf-docker-cpi-work/` clone (deploy-director already put it there).
+- **Outputs**: runtime-config registered on the director under the name `dns`. `status.json` records `applied_sha=<8>`.
+- **Cheap check**: status PASS exists.
+- **Deep check** (`--verify`): `bosh runtime-config --name dns | sha256sum` on the remote matches the recorded `applied_sha`.
+- **Failure modes**: director not logged in (step 7 regressed); `dns.yml` missing from the remote clone (deploy-director didn't run); director lacks a config server, e.g., UAA/CredHub were dropped from deploy-director — in that case `bosh update-runtime-config` fails with `Failed to generate variable '/dns_healthcheck_tls_ca' from config server`.
+
+## 11. `deploy-cf`
 
 `bosh deploy` cf-deployment with bosh-lite ops files. **The long step** (30-60 min on first run).
 
@@ -161,7 +171,7 @@ cf-deployment v56.4.0's bosh-lite cloud-config emits three things that bosh-dock
 - `vm_extensions/cf-tcp-router-network-properties/cloud_properties/ports`: `["1024-1123"]` → `[]` (docker rejects range syntax).
 - `networks/default/subnets[0]`: `cloud_properties.name: random` + `10.244.0.0/20` → `name: cf-docker-cpi-net` + `10.245.0.0/24` (statics 10.245.0.12-99). The default `random` directive makes the CPI create a fresh isolated bridge per deploy; the director (on `cf-docker-cpi-net`) can't NATS into VMs on a sibling bridge. Sharing the network puts VMs and director on the same L2.
 
-## 11. `configure-cf-cli`
+## 12. `configure-cf-cli`
 
 Point `cf` at the new CF, log in as admin, create initial org/space.
 
@@ -172,7 +182,7 @@ Point `cf` at the new CF, log in as admin, create initial org/space.
 - **Failure modes**:
   - API endpoint unreachable — likely `/etc/hosts` entry missing or haproxy port-forward not set up.
   - SSL errors (we use `--skip-ssl-validation`).
-  - Admin pw not found — step 10 didn't complete.
+  - Admin pw not found — step 11 didn't complete.
 
 ### `/etc/hosts` reachability
 
@@ -186,7 +196,7 @@ For the local `cf` CLI to reach `api.<system_domain>`, the system_domain hostnam
 
 Pass `--write-hosts` (interactive mode only, requires sudo) to have the step append the line for you. Documented gotcha: on WSL2 the docker daemon may not bind haproxy on `0.0.0.0` reliably; the escape hatch is to `cf push` from a container colocated on the docker host via `bosh ssh`.
 
-## 12. `smoke-push`
+## 13. `smoke-push`
 
 Fetch a minimal Spring Boot web app, build it, `cf push`. Verify HTTP 200.
 
@@ -197,7 +207,7 @@ Fetch a minimal Spring Boot web app, build it, `cf push`. Verify HTTP 200.
 - **Failure modes**:
   - Spring Initializr unreachable.
   - Build fails (Java version mismatch — usually fine since we use the system `mvnw`).
-  - Route DNS unresolvable from local — same `/etc/hosts` issue as step 11.
+  - Route DNS unresolvable from local — same `/etc/hosts` issue as step 12.
   - App crashes during start — instance logs surfaced via `cf logs cf-smoke --recent`.
 
 The app is fetched via:

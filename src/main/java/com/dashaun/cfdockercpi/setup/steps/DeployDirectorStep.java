@@ -53,7 +53,8 @@ public class DeployDirectorStep implements SetupStep {
 
     @Override
     public String description() {
-        return "Run `bosh create-env` on the remote docker host to spin up the BOSH director container.";
+        return "Run `bosh create-env` on the remote docker host to spin up the BOSH director container "
+                + "(with UAA + CredHub colocated so runtime-config variables can be generated).";
     }
 
     @Override
@@ -215,6 +216,8 @@ public class DeployDirectorStep implements SetupStep {
             + "  -o bosh-deployment/docker/cpi.yml \\\n"
             + "  -o docker-cpi-overrides.yml \\\n"
             + "  -o bosh-deployment/jumpbox-user.yml \\\n"
+            + "  -o bosh-deployment/uaa.yml \\\n"
+            + "  -o bosh-deployment/credhub.yml \\\n"
             + "  --vars-store director-creds.yml \\\n"
             + "  --state director-state.json \\\n"
             + "  --vars-file director-vars.yml \\\n"

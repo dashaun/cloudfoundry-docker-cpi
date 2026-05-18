@@ -99,7 +99,7 @@ Existing `docker verify` stays as-is and is invoked by `setup up` via `Verificat
 
 See [setup-pipeline.md](setup-pipeline.md) for step-by-step failure modes, and the [meta issue](https://github.com/dashaun/cloudfoundry-docker-cpi/issues) for the latest status on:
 
-- **Network reachability local→deployed CF**: `/etc/hosts` + host port-forward is the recommended path; details in step 11.
+- **Network reachability local→deployed CF**: `/etc/hosts` + host port-forward is the recommended path; details in step 12.
 - **WSL2 quirks**: WSL2 docker may not bind haproxy on `0.0.0.0` reliably; documented escape hatch is `bosh ssh` + colocated `cf push`.
 - **`deploy-cf` runtime**: 30-60 min; bosh output streamed live.
 - **Resources**: deploy-cf needs ~16 GB RAM and ~50 GB disk on the host.
