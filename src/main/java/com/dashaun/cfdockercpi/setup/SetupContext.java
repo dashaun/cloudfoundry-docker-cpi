@@ -17,7 +17,8 @@ public record SetupContext(
         String directorIp,
         String internalCidr,
         String systemDomain,
-        boolean ignoreResourceCheck) {
+        boolean ignoreResourceCheck,
+        boolean writeHosts) {
 
     public static final String DEFAULT_DIRECTOR_NAME = "cf-docker-cpi";
     public static final String DEFAULT_DIRECTOR_IP = "10.245.0.11";
@@ -39,5 +40,9 @@ public record SetupContext(
 
     public Path newLogFile(String stepName) {
         return logsDir().resolve(stepName + "-" + LOG_TS.format(Instant.now()) + ".log");
+    }
+
+    public Path cfHome() {
+        return stateDir.resolve("cf-home");
     }
 }

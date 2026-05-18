@@ -53,12 +53,17 @@ public class SetupCommands {
             String systemDomain,
             @Option(longName = "ignore-resource-check",
                     description = "Bypass the deploy-cf 16 GiB RAM / 50 GiB disk precheck")
-            boolean ignoreResourceCheck) throws Exception {
+            boolean ignoreResourceCheck,
+            @Option(longName = "write-hosts",
+                    description = "configure-cf-cli: append missing api/login/uaa/cf-smoke "
+                            + "hostnames to /etc/hosts (requires interactive sudo on macOS/Linux)")
+            boolean writeHosts) throws Exception {
 
         if (name == null || name.isBlank()) {
             return "ERROR: --name is required.\nKnown steps: " + String.join(", ", orchestrator.stepNames());
         }
-        SetupContext ctx = buildContext(host, remoteSocket, verify, force, systemDomain, ignoreResourceCheck);
+        SetupContext ctx = buildContext(host, remoteSocket, verify, force,
+                systemDomain, ignoreResourceCheck, writeHosts);
         StepResult result = orchestrator.runStep(name, ctx);
         return renderResult(ctx, name, result);
     }
@@ -74,13 +79,14 @@ public class SetupCommands {
             String remoteSocket) throws Exception {
 
         SetupContext ctx = buildContext(host, remoteSocket, false, false,
-                SetupContext.DEFAULT_SYSTEM_DOMAIN, false);
+                SetupContext.DEFAULT_SYSTEM_DOMAIN, false, false);
         Map<String, StepStatus> persisted = orchestrator.status(ctx);
         return renderStatus(ctx, orchestrator.stepNames(), persisted);
     }
 
     private SetupContext buildContext(String host, String remoteSocket, boolean verify, boolean force,
-                                      String systemDomain, boolean ignoreResourceCheck) {
+                                      String systemDomain, boolean ignoreResourceCheck,
+                                      boolean writeHosts) {
         DockerTarget target = resolver.resolve(host, remoteSocket);
         String slug = HostSlug.from(target);
         Path home = Paths.get(System.getProperty("user.home"));
@@ -90,7 +96,7 @@ public class SetupCommands {
                 SetupContext.DEFAULT_DIRECTOR_IP, SetupContext.DEFAULT_INTERNAL_CIDR,
                 systemDomain == null || systemDomain.isBlank()
                         ? SetupContext.DEFAULT_SYSTEM_DOMAIN : systemDomain,
-                ignoreResourceCheck);
+                ignoreResourceCheck, writeHosts);
     }
 
     private String renderResult(SetupContext ctx, String name, StepResult result) {
