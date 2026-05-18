@@ -38,12 +38,20 @@ public class UpdateRuntimeConfigStep implements SetupStep {
     // then fails the VM loudly if DNS is still broken so the symptom points at the
     // resolver, not at rep.
     static final String DNS_WAIT_RELEASE_NAME = "cf-docker-cpi-dns-wait";
-    static final String DNS_WAIT_RELEASE_VERSION = "0.1.0";
+    // v0.2.0: pre-start now ALSO takes over /etc/resolv.conf with a plain file pointing
+    // directly at the bosh-dns listener, bypassing systemd-resolved's flaky stub forwarder.
+    // Go binaries (rep, route_emitter, etc.) read /etc/resolv.conf directly via Go's pure
+    // resolver — they don't go through nsswitch/libc/systemd-resolved — so the symlink to
+    // /run/systemd/resolve/stub-resolv.conf (nameserver 127.0.0.53) is what trips them up.
+    static final String DNS_WAIT_RELEASE_VERSION = "0.2.0";
     static final String DNS_WAIT_RELEASE_DIR = "dns-wait-release";
     static final String DNS_WAIT_RELEASE_TARBALL = "dns-wait-release.tgz";
     static final String DNS_WAIT_CONFIG_FILE = "dns-wait-runtime-config.yml";
     static final int PRE_START_TIMEOUT_SECONDS = 300;
     static final int PRE_START_POLL_INTERVAL_SECONDS = 5;
+    // bosh-dns's default IPv4 listener inside cf-deployment VMs. Confirmed on senshin by
+    // `dig @169.254.0.2 locket.service.cf.internal +short` returning the expected IP.
+    static final String BOSH_DNS_LISTENER = "169.254.0.2";
 
     static final String DNS_SHA_MARKER = "[dns-applied-sha]";
     static final String DNS_WAIT_SHA_MARKER = "[dns-wait-applied-sha]";
@@ -243,43 +251,97 @@ public class UpdateRuntimeConfigStep implements SetupStep {
             + "    default: " + PRE_START_TIMEOUT_SECONDS + "\n"
             + "  wait_for_locket_dns.poll_interval_seconds:\n"
             + "    description: Seconds between successive getent attempts\n"
-            + "    default: " + PRE_START_POLL_INTERVAL_SECONDS + "\n";
+            + "    default: " + PRE_START_POLL_INTERVAL_SECONDS + "\n"
+            + "  wait_for_locket_dns.bosh_dns_listener:\n"
+            + "    description: |\n"
+            + "      Address of the bosh-dns listener on the local VM. After pre-start confirms\n"
+            + "      bosh-dns is reachable via libc, /etc/resolv.conf is rewritten to point\n"
+            + "      directly here, bypassing systemd-resolved's stub forwarder (which is flaky\n"
+            + "      for Go binaries on noble — they read /etc/resolv.conf directly via Go's\n"
+            + "      pure-resolver mode, not via libc/nsswitch).\n"
+            + "    default: " + BOSH_DNS_LISTENER + "\n";
     }
 
     private static String preStartTemplate() {
         return ""
             + "#!/usr/bin/env bash\n"
             + "# Issue #16: on noble docker stemcells, systemd-resolved -> bosh-dns forwarding can\n"
-            + "# race bosh-dns coming up on the local VM. rep panics in initializeCellPresence\n"
-            + "# (context-deadline-exceeded on locket client) before the resolver settles. Hold the\n"
-            + "# VM in pre-start until libc can resolve <host>, then fail loudly if it never does so\n"
-            + "# the symptom points at DNS instead of at a confusing rep crash.\n"
+            + "# race bosh-dns coming up on the local VM, AND systemd-resolved's stub forwarder is\n"
+            + "# itself flaky from Go binaries that read /etc/resolv.conf directly (rep,\n"
+            + "# route_emitter — they bypass nsswitch).\n"
+            + "#\n"
+            + "# Two-step fix:\n"
+            + "#   1. Wait for `getent hosts <locket>` to work — proves bosh-dns is up listening\n"
+            + "#      on $LISTENER (otherwise systemd-resolved couldn't forward to it).\n"
+            + "#   2. Atomically replace /etc/resolv.conf (currently a symlink to systemd-\n"
+            + "#      resolved's stub-resolv.conf) with a plain file pointing directly at\n"
+            + "#      $LISTENER. systemd-resolved only manages /etc/resolv.conf when it's a\n"
+            + "#      symlink to one of its files; a plain file is left alone.\n"
             + "set -euo pipefail\n"
             + "\n"
             + "HOST=\"<%= p('wait_for_locket_dns.host') %>\"\n"
             + "TIMEOUT=<%= p('wait_for_locket_dns.timeout_seconds') %>\n"
             + "INTERVAL=<%= p('wait_for_locket_dns.poll_interval_seconds') %>\n"
+            + "LISTENER=\"<%= p('wait_for_locket_dns.bosh_dns_listener') %>\"\n"
             + "\n"
             + "LOG_DIR=/var/vcap/sys/log/wait-for-locket-dns\n"
             + "mkdir -p \"$LOG_DIR\"\n"
             + "exec >>\"$LOG_DIR/pre-start.log\" 2>&1\n"
             + "\n"
-            + "echo \"[$(date -Iseconds)] waiting for ${HOST} (timeout=${TIMEOUT}s, interval=${INTERVAL}s)\"\n"
+            + "echo \"[$(date -Iseconds)] waiting for ${HOST} via libc (timeout=${TIMEOUT}s, interval=${INTERVAL}s)\"\n"
             + "\n"
             + "deadline=$(( $(date +%s) + TIMEOUT ))\n"
             + "attempt=0\n"
             + "while :; do\n"
             + "  attempt=$((attempt + 1))\n"
             + "  if getent hosts \"$HOST\" >/dev/null 2>&1; then\n"
-            + "    echo \"[$(date -Iseconds)] resolved ${HOST} on attempt ${attempt}\"\n"
-            + "    exit 0\n"
+            + "    echo \"[$(date -Iseconds)] libc resolved ${HOST} on attempt ${attempt}\"\n"
+            + "    break\n"
             + "  fi\n"
             + "  if [ \"$(date +%s)\" -ge \"$deadline\" ]; then\n"
-            + "    echo \"[$(date -Iseconds)] FAILED to resolve ${HOST} within ${TIMEOUT}s (${attempt} attempts)\"\n"
+            + "    echo \"[$(date -Iseconds)] FAILED to resolve ${HOST} via libc within ${TIMEOUT}s (${attempt} attempts)\"\n"
             + "    exit 1\n"
             + "  fi\n"
             + "  sleep \"$INTERVAL\"\n"
-            + "done\n";
+            + "done\n"
+            + "\n"
+            + "# bosh-dns is up. Sanity-check direct reachability before we cut systemd-resolved out\n"
+            + "# of the path. If this fails the wait somehow lied (e.g. bosh-dns forwarder rather\n"
+            + "# than bosh-dns itself answered) — surface that loudly instead of leaving the VM\n"
+            + "# with a broken /etc/resolv.conf.\n"
+            + "if command -v dig >/dev/null 2>&1; then\n"
+            + "  if ! dig +time=2 +tries=1 +short \"@${LISTENER}\" \"${HOST}\" >/dev/null; then\n"
+            + "    echo \"[$(date -Iseconds)] FAILED to dig ${HOST} @${LISTENER} directly; aborting takeover\"\n"
+            + "    exit 1\n"
+            + "  fi\n"
+            + "  echo \"[$(date -Iseconds)] verified ${HOST} resolves via ${LISTENER} directly\"\n"
+            + "fi\n"
+            + "\n"
+            + "# Take over /etc/resolv.conf with a plain file pointing at the bosh-dns listener.\n"
+            + "# Atomic replace via mv -f, so anything in the middle of a lookup sees either the\n"
+            + "# old symlink or the new plain file, never a half-written state.\n"
+            + "if [ -L /etc/resolv.conf ] || ! grep -q \"^nameserver ${LISTENER}\\$\" /etc/resolv.conf 2>/dev/null; then\n"
+            + "  tmp=$(mktemp /etc/resolv.conf.cfdcpi.XXXXXX)\n"
+            + "  cat > \"$tmp\" <<EOF\n"
+            + "# Managed by cf-docker-cpi-dns-wait pre-start (issue #16).\n"
+            + "# Original /etc/resolv.conf was a symlink to systemd-resolved's stub; that's flaky\n"
+            + "# from Go binaries on noble docker stemcells. Pointing directly at bosh-dns instead.\n"
+            + "nameserver ${LISTENER}\n"
+            + "options timeout:2 attempts:3\n"
+            + "EOF\n"
+            + "  chmod 0644 \"$tmp\"\n"
+            + "  mv -f \"$tmp\" /etc/resolv.conf\n"
+            + "  echo \"[$(date -Iseconds)] /etc/resolv.conf rewritten to plain file with nameserver ${LISTENER}\"\n"
+            + "else\n"
+            + "  echo \"[$(date -Iseconds)] /etc/resolv.conf already a plain file pointing at ${LISTENER}; skipping takeover\"\n"
+            + "fi\n"
+            + "\n"
+            + "# Re-verify libc still works through the new plain file (sanity).\n"
+            + "if ! getent hosts \"$HOST\" >/dev/null 2>&1; then\n"
+            + "  echo \"[$(date -Iseconds)] FAILED: ${HOST} no longer resolves after takeover\"\n"
+            + "  exit 1\n"
+            + "fi\n"
+            + "echo \"[$(date -Iseconds)] takeover verified; pre-start done\"\n";
     }
 
     private static String dnsWaitRuntimeConfig() {
