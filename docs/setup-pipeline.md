@@ -14,7 +14,23 @@ Wraps the existing `VerificationService` (also exposed standalone as `docker ver
 - **Deep check** (`--verify`): re-run the full check sequence (ping → version → info → OS → arch → resources → CPI prereqs → API version).
 - **Failure modes**: any FAIL from an underlying check halts the pipeline.
 
-## 2. `install-tools`
+## 2. `host-setup`
+
+Tune docker-host kernel limits that affect stemcell containers. Today this is just the `fs.inotify.*` knobs (see issue #14 for the symptom); the step is meant to absorb additional host-level prereqs as we find them.
+
+- **Inputs**: the SSH target.
+- **Outputs**: `/etc/sysctl.d/99-cf-docker-cpi.conf` on the docker host with `fs.inotify.max_user_instances = 8192` and `fs.inotify.max_user_watches = 65536`, plus a live `sysctl --load` so it takes effect immediately. The step only writes the dropin when current values are below the floor.
+- **Cheap check**: status PASS exists.
+- **Deep check** (`--verify`): re-read `/proc/sys/fs/inotify/{max_user_instances,max_user_watches}` and confirm both meet the minimums.
+- **Failure modes**:
+  - User lacks passwordless sudo on the docker host → the step prints the manual recipe (`sudo tee /etc/sysctl.d/99-cf-docker-cpi.conf ... && sudo sysctl --load=...`) and exits.
+  - Sysctl applied but the kernel reports values still below the floor (extremely unlikely; would mean another sysctl drop-in overrides ours).
+
+### Why this step exists
+
+The Linux default `fs.inotify.max_user_instances = 128` is a per-uid host-wide cap. Every stemcell container runs its own systemd + journald + udevd, all as uid 0 which maps to the host's uid 0 (non-userns docker). With ~16 CF instance-group VMs the host's pool is exhausted; new processes inside late-starting containers get `EMFILE` from `inotify_init()`. systemd-udevd inside the container then crash-loops, and the BOSH agent fails to come back up after the CPI's apply-settings container restart. The director times out pinging the dead agent; the container itself stays `Up`. Bumping the per-uid cap to 8192 (the same value used by kubernetes/containerd reference setups) makes the pool effectively unbounded for our deploy.
+
+## 3. `install-tools`
 
 Download `bosh` and `cf` CLIs to `~/.cf-docker-cpi/bin/`. Versions pinned in code.
 
@@ -24,7 +40,7 @@ Download `bosh` and `cf` CLIs to `~/.cf-docker-cpi/bin/`. Versions pinned in cod
 - **Deep check**: same as cheap; nothing remote to probe.
 - **Failure modes**: unknown OS/arch combo — fail with the detected `os.name`/`os.arch` in the error. Download checksum mismatch — fail with both expected and actual SHA.
 
-## 3. `fetch-manifests`
+## 4. `fetch-manifests`
 
 Clone `cloudfoundry/bosh-deployment` and `cloudfoundry/cf-deployment` into the host state dir at pinned commits.
 
@@ -34,7 +50,7 @@ Clone `cloudfoundry/bosh-deployment` and `cloudfoundry/cf-deployment` into the h
 - **Deep check**: same; upstream is not contacted unless the user passes `--update` (future flag).
 - **Failure modes**: network failure during clone (transient, retry). Pinned SHA not found — upstream rebased; the pin needs updating in code.
 
-## 4. `generate-director-vars`
+## 5. `generate-director-vars`
 
 Write `director-vars.yml` with director IP, internal CIDR, and the runtime docker socket URL.
 
@@ -44,11 +60,11 @@ Write `director-vars.yml` with director IP, internal CIDR, and the runtime docke
 - **Deep check**: same as cheap.
 - **Failure modes**: state dir not writable; tunnel not yet established when called (orchestrator bug — fail loudly).
 
-## 5. `deploy-director`
+## 6. `deploy-director`
 
 `bosh create-env` the BOSH director. ~5 min on first run.
 
-- **Inputs**: `bosh-deployment/bosh.yml`, `bosh-deployment/docker/cpi.yml`, `bosh-deployment/jumpbox-user.yml`, `director-vars.yml`, plus an inlined `docker-cpi-overrides.yml` ops file.
+- **Inputs**: `bosh-deployment/bosh.yml`, `bosh-deployment/docker/cpi.yml`, `bosh-deployment/jumpbox-user.yml`, `bosh-deployment/uaa.yml`, `bosh-deployment/credhub.yml`, `director-vars.yml`, plus an inlined `docker-cpi-overrides.yml` ops file. UAA + CredHub are colocated on the director so the director has a built-in config server — required for generating the `/-prefixed` shared variables that the `dns` runtime-config defines (see §10).
 - **Outputs**: `director-state.json` (contains VM CID), `director-creds.yml` (admin password, mTLS certs, jumpbox SSH key).
 - **Cheap check**: `director-state.json` exists with a non-empty `current_vm_cid` and matches the recorded `current_manifest_sha`.
 - **Deep check**: `bosh env -e <slug>` succeeds against the director IP through the tunnel.
@@ -87,7 +103,7 @@ sudo systemctl daemon-reload && sudo systemctl restart docker
 
 `deploy-director` then requires a matching CA + client cert/key triple at `~/.cf-docker-cpi-work/tls/{ca,client-cert,client-key}.pem` on the docker host. They are injected into the BOSH ops file via `bosh create-env --var-file cf_docker_cpi_tls_{ca,cert,key}=tls/...`. There is no automated step that generates these certs yet — see the bootstrap precheck in `DeployDirectorStep`. The `cloud_provider` (host-side) CPI keeps `unix:///var/run/docker.sock` and an auto-generated dummy TLS block; unix:// never negotiates TLS so the dummy values are inert.
 
-## 6. `login-director`
+## 7. `login-director`
 
 `bosh alias-env <slug>` then `bosh log-in` with admin creds from `director-creds.yml`.
 
@@ -95,9 +111,9 @@ sudo systemctl daemon-reload && sudo systemctl restart docker
 - **Outputs**: entry in `~/.bosh/config` for the alias.
 - **Cheap check**: `~/.bosh/config` has the alias and `bosh env -e <slug>` succeeds.
 - **Deep check**: same.
-- **Failure modes**: director not reachable (likely tunnel issue). Creds file missing — step 5 didn't complete.
+- **Failure modes**: director not reachable (likely tunnel issue). Creds file missing — step 6 didn't complete.
 
-## 7. `upload-stemcell`
+## 8. `upload-stemcell`
 
 `bosh upload-stemcell` for the pinned warden stemcell version.
 
@@ -105,9 +121,9 @@ sudo systemctl daemon-reload && sudo systemctl restart docker
 - **Outputs**: stemcell present on director.
 - **Cheap check**: status file says PASS in this director state.
 - **Deep check**: `bosh stemcells` lists the pinned name+version.
-- **Failure modes**: GCS transient unavailability; director out of disk — surfaced by bosh. CPI-to-dockerd connectivity issues surface here because this is the first step that actually exercises the in-container CPI (`create_stemcell` POSTs the image to dockerd) — if you see TLS/HTTPS errors, revisit §5's dockerd TLS prereq.
+- **Failure modes**: GCS transient unavailability; director out of disk — surfaced by bosh. CPI-to-dockerd connectivity issues surface here because this is the first step that actually exercises the in-container CPI (`create_stemcell` POSTs the image to dockerd) — if you see TLS/HTTPS errors, revisit §6's dockerd TLS prereq.
 
-## 8. `update-cloud-config`
+## 9. `update-cloud-config`
 
 `bosh update-cloud-config` with `cf-deployment/iaas-support/bosh-lite/cloud-config.yml`.
 
@@ -115,9 +131,19 @@ sudo systemctl daemon-reload && sudo systemctl restart docker
 - **Outputs**: cloud-config in the director; no new local file. `status.json` records `file_sha=<8> applied_sha=<8>` — the SHA of the source file we sent, and the SHA of what `bosh cloud-config` returns from the director after apply.
 - **Cheap check**: status PASS exists AND the current local file's SHA matches the recorded `file_sha`. If the cf-deployment pin moves (different SHA), the step is re-run.
 - **Deep check** (`--verify`): cheap check passes AND `bosh -e <slug> cloud-config | sha256sum` on the remote matches the recorded `applied_sha`. Catches director-side drift (manual edits, lost state).
-- **Failure modes**: director not logged in (step 6 regressed); YAML syntax error in cf-deployment (upstream issue); `bosh cloud-config` returns the empty/none response after a successful apply (director persistence bug — surfaces as missing `applied_sha` in the run output).
+- **Failure modes**: director not logged in (step 7 regressed); YAML syntax error in cf-deployment (upstream issue); `bosh cloud-config` returns the empty/none response after a successful apply (director persistence bug — surfaces as missing `applied_sha` in the run output).
 
-## 9. `deploy-cf`
+## 10. `update-runtime-config`
+
+`bosh update-runtime-config bosh-deployment/runtime-configs/dns.yml --name dns` so bosh-dns is added as an addon on every VM in every deployment. Without this, `route_registrar` (and anything else resolving `*.service.cf.internal`) crashes during `deploy-cf` with `dial tcp: lookup nats.service.cf.internal on 127.0.0.53:53: server misbehaving`.
+
+- **Inputs**: `bosh-deployment/runtime-configs/dns.yml` from the remote `~/.cf-docker-cpi-work/` clone (deploy-director already put it there).
+- **Outputs**: runtime-config registered on the director under the name `dns`. `status.json` records `applied_sha=<8>`.
+- **Cheap check**: status PASS exists.
+- **Deep check** (`--verify`): `bosh runtime-config --name dns | sha256sum` on the remote matches the recorded `applied_sha`.
+- **Failure modes**: director not logged in (step 7 regressed); `dns.yml` missing from the remote clone (deploy-director didn't run); director lacks a config server, e.g., UAA/CredHub were dropped from deploy-director — in that case `bosh update-runtime-config` fails with `Failed to generate variable '/dns_healthcheck_tls_ca' from config server`.
+
+## 11. `deploy-cf`
 
 `bosh deploy` cf-deployment with bosh-lite ops files. **The long step** (30-60 min on first run).
 
@@ -130,10 +156,10 @@ sudo systemctl daemon-reload && sudo systemctl restart docker
   - Pins `instance_groups/router/networks[default]/static_ips` to `10.245.0.34` (cf-deployment's bosh-lite.yml hardcodes `10.244.0.34`, outside our `cf-docker-cpi-net` subnet).
   - Updates the `load_balancer` security group rule destination to match.
 - **Failure modes**:
-  - Stemcell missing (step 7 didn't run).
+  - Stemcell missing (step 8 didn't run).
   - Host out of RAM/disk — caught by the precheck unless bypassed.
   - Release downloads timeout (transient; resume the step — bosh deploy is idempotent).
-  - **Known blocker**: pxc-mysql `database` instance's BOSH agent goes unresponsive during its first job update (post-stop runs for ~10 min, then 600s ping timeout). The container itself stays running; only the agent hangs. Likely a noble-stemcell / pxc-release / bosh-docker-cpi 0.2.12 compat issue. Tracked separately.
+  - **Issue #14 root cause + fix**: the previously-observed "pxc-mysql post-stop hang" was a symptom, not the cause. The actual problem was host `fs.inotify.max_user_instances=128` (Linux default) being exhausted by ~16 stemcell containers each running their own systemd + journald + udevd against the host's per-uid inotify pool. Containers brought up later in the deploy (database, which is updated after the nats canary) lose the race, their `systemd-udevd` crash-loops with `Failed to create inotify descriptor: Too many open files`, and the bosh-agent fails to come back up after the CPI's apply-settings container restart. The director then times out pinging the dead agent. Fixed by the `host-setup` step (§2) which raises `fs.inotify.max_user_instances` to >= 8192 on the docker host.
 
 The step streams `bosh` stdout live to both the terminal and `logs/deploy-cf-<ts>.log`.
 
@@ -145,7 +171,7 @@ cf-deployment v56.4.0's bosh-lite cloud-config emits three things that bosh-dock
 - `vm_extensions/cf-tcp-router-network-properties/cloud_properties/ports`: `["1024-1123"]` → `[]` (docker rejects range syntax).
 - `networks/default/subnets[0]`: `cloud_properties.name: random` + `10.244.0.0/20` → `name: cf-docker-cpi-net` + `10.245.0.0/24` (statics 10.245.0.12-99). The default `random` directive makes the CPI create a fresh isolated bridge per deploy; the director (on `cf-docker-cpi-net`) can't NATS into VMs on a sibling bridge. Sharing the network puts VMs and director on the same L2.
 
-## 10. `configure-cf-cli`
+## 12. `configure-cf-cli`
 
 Point `cf` at the new CF, log in as admin, create initial org/space.
 
@@ -156,7 +182,7 @@ Point `cf` at the new CF, log in as admin, create initial org/space.
 - **Failure modes**:
   - API endpoint unreachable — likely `/etc/hosts` entry missing or haproxy port-forward not set up.
   - SSL errors (we use `--skip-ssl-validation`).
-  - Admin pw not found — step 9 didn't complete.
+  - Admin pw not found — step 11 didn't complete.
 
 ### `/etc/hosts` reachability
 
@@ -170,7 +196,7 @@ For the local `cf` CLI to reach `api.<system_domain>`, the system_domain hostnam
 
 Pass `--write-hosts` (interactive mode only, requires sudo) to have the step append the line for you. Documented gotcha: on WSL2 the docker daemon may not bind haproxy on `0.0.0.0` reliably; the escape hatch is to `cf push` from a container colocated on the docker host via `bosh ssh`.
 
-## 11. `smoke-push`
+## 13. `smoke-push`
 
 Fetch a minimal Spring Boot web app, build it, `cf push`. Verify HTTP 200.
 
@@ -181,7 +207,7 @@ Fetch a minimal Spring Boot web app, build it, `cf push`. Verify HTTP 200.
 - **Failure modes**:
   - Spring Initializr unreachable.
   - Build fails (Java version mismatch — usually fine since we use the system `mvnw`).
-  - Route DNS unresolvable from local — same `/etc/hosts` issue as step 10.
+  - Route DNS unresolvable from local — same `/etc/hosts` issue as step 12.
   - App crashes during start — instance logs surfaced via `cf logs cf-smoke --recent`.
 
 The app is fetched via:
