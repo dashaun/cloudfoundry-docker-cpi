@@ -183,6 +183,11 @@ public class UpdateRuntimeConfigStep implements SetupStep {
             + "name: " + DNS_WAIT_RELEASE_NAME + "\n"
             + "CFEOF\n"
             + "\n"
+            + "# bosh create-release reads blobs.yml unconditionally even for zero-blob releases.\n"
+            + "cat > " + DNS_WAIT_RELEASE_DIR + "/config/blobs.yml <<'BLOBEOF'\n"
+            + "--- {}\n"
+            + "BLOBEOF\n"
+            + "\n"
             + "cat > " + DNS_WAIT_RELEASE_DIR + "/jobs/wait-for-locket-dns/spec <<'SPECEOF'\n"
             + jobSpec()
             + "SPECEOF\n"
