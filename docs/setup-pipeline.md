@@ -121,16 +121,29 @@ sudo systemctl daemon-reload && sudo systemctl restart docker
 
 `bosh deploy` cf-deployment with bosh-lite ops files. **The long step** (30-60 min on first run).
 
-- **Inputs**: `cf-deployment/cf-deployment.yml`, `cf-deployment/operations/bosh-lite.yml`, `cf-deployment/operations/use-compiled-releases.yml`, `system_domain` var, `cf-creds.yml` (vars-store).
-- **Outputs**: `cf-creds.yml` populated with generated passwords/certs; CF running on the director.
-- **Cheap check**: status PASS and `cf-creds.yml` exists with `cf_admin_password` populated.
-- **Deep check**: `bosh -d cf deployment` shows the deployment in `success` state, no failed tasks since.
-- **Pre-run resource check**: from `docker info`, fail fast if `MemTotal` < 16 GiB or disk free < 50 GiB. Bypass with `--ignore-resource-check`.
+- **Inputs**: `cf-deployment/cf-deployment.yml` + `operations/bosh-lite.yml` + `operations/use-compiled-releases.yml`, an inlined `cf-deployment-docker-cpi-overrides.yml` ops file, `--system-domain` (default `bosh-lite.com`), `cf-creds.yml` vars-store.
+- **Outputs**: `<host>/cf-creds.yml` (scp'd back from the docker host); CF running on the director.
+- **Cheap check**: status PASS AND local `cf-creds.yml` has a non-empty `cf_admin_password` value.
+- **Deep check** (`--verify`): cheap check PLUS `bosh -e <slug> -d cf deployment` exits 0 on the remote (deployment is registered with the director).
+- **Pre-run resource check**: SSHes the host and queries `docker info --format '{{.MemTotal}}'` and `df -B1 --output=avail <DockerRootDir>`. Fails fast if MemTotal < 16 GiB or disk free < 50 GiB. Bypass with `--ignore-resource-check`.
+- **Inlined ops** (`cf-deployment-docker-cpi-overrides.yml`):
+  - Pins `instance_groups/router/networks[default]/static_ips` to `10.245.0.34` (cf-deployment's bosh-lite.yml hardcodes `10.244.0.34`, outside our `cf-docker-cpi-net` subnet).
+  - Updates the `load_balancer` security group rule destination to match.
 - **Failure modes**:
   - Stemcell missing (step 7 didn't run).
   - Host out of RAM/disk — caught by the precheck unless bypassed.
-  - Release downloads timeout (transient; resume the step).
-  - Output is streamed live to terminal AND `logs/deploy-cf-<ts>.log` so users see progress.
+  - Release downloads timeout (transient; resume the step — bosh deploy is idempotent).
+  - **Known blocker**: pxc-mysql `database` instance's BOSH agent goes unresponsive during its first job update (post-stop runs for ~10 min, then 600s ping timeout). The container itself stays running; only the agent hangs. Likely a noble-stemcell / pxc-release / bosh-docker-cpi 0.2.12 compat issue. Tracked separately.
+
+The step streams `bosh` stdout live to both the terminal and `logs/deploy-cf-<ts>.log`.
+
+### Why update-cloud-config does so much more than "apply YAML"
+
+cf-deployment v56.4.0's bosh-lite cloud-config emits three things that bosh-docker-cpi 0.2.12 can't handle as-is. `UpdateCloudConfigStep` writes a `cloud-config-docker-cpi-overrides.yml` on the remote and runs `bosh interpolate` before applying:
+
+- `vm_extensions/ssh-proxy-and-router-lb/cloud_properties/ports`: `[{host: 80}, ...]` → `["80", "443", "2222"]` (CPI wants `[]string`).
+- `vm_extensions/cf-tcp-router-network-properties/cloud_properties/ports`: `["1024-1123"]` → `[]` (docker rejects range syntax).
+- `networks/default/subnets[0]`: `cloud_properties.name: random` + `10.244.0.0/20` → `name: cf-docker-cpi-net` + `10.245.0.0/24` (statics 10.245.0.12-99). The default `random` directive makes the CPI create a fresh isolated bridge per deploy; the director (on `cf-docker-cpi-net`) can't NATS into VMs on a sibling bridge. Sharing the network puts VMs and director on the same L2.
 
 ## 10. `configure-cf-cli`
 

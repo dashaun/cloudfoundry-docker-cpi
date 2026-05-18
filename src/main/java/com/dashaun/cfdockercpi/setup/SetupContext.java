@@ -15,12 +15,15 @@ public record SetupContext(
         boolean verify,
         boolean force,
         String directorIp,
-        String internalCidr) {
+        String internalCidr,
+        String systemDomain,
+        boolean ignoreResourceCheck) {
 
     public static final String DEFAULT_DIRECTOR_NAME = "cf-docker-cpi";
     public static final String DEFAULT_DIRECTOR_IP = "10.245.0.11";
     public static final String DEFAULT_INTERNAL_CIDR = "10.245.0.0/24";
     public static final String DEFAULT_INTERNAL_GW = "10.245.0.1";
+    public static final String DEFAULT_SYSTEM_DOMAIN = "bosh-lite.com";
 
     private static final DateTimeFormatter LOG_TS = DateTimeFormatter
             .ofPattern("yyyyMMdd-HHmmss")

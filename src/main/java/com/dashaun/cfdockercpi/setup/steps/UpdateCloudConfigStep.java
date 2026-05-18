@@ -30,7 +30,38 @@ public class UpdateCloudConfigStep implements SetupStep {
     static final Path LOCAL_CLOUD_CONFIG_REL =
             Path.of("cf-deployment", "iaas-support", "bosh-lite", "cloud-config.yml");
     static final String REMOTE_CLOUD_CONFIG = "cloud-config.yml";
+    static final String REMOTE_CLOUD_CONFIG_OVERRIDES = "cloud-config-docker-cpi-overrides.yml";
+    static final String REMOTE_CLOUD_CONFIG_RENDERED = "cloud-config-rendered.yml";
     static final String APPLIED_SHA_MARKER = "[applied-sha]";
+
+    // bosh-docker-cpi 0.2.12 quirks vs cf-deployment v56.4.0 bosh-lite cloud-config:
+    //  * `ports` must be []string ("80", "443") — cf-deployment emits [{host: 80}, ...] (modern shape).
+    //  * Port range syntax "1024-1123" is rejected by docker's port parser; drop it (tcp routing
+    //    isn't exercised by smoke-push, and bosh-lite doesn't bind it anyway).
+    //  * Network `cloud_properties.name: random` creates a per-deploy isolated docker network,
+    //    which the director (on cf-docker-cpi-net) can't reach. Force VMs onto cf-docker-cpi-net
+    //    so the director can speak NATS to their agents; subnet/static range collapses to /24.
+    private static final String CLOUD_CONFIG_OVERRIDES = ""
+            + "- type: replace\n"
+            + "  path: /networks/name=default/subnets\n"
+            + "  value:\n"
+            + "  - azs: [z1, z2, z3]\n"
+            + "    cloud_properties:\n"
+            + "      name: cf-docker-cpi-net\n"
+            + "    gateway: 10.245.0.1\n"
+            + "    range: 10.245.0.0/24\n"
+            + "    reserved:\n"
+            + "    - 10.245.0.1\n"
+            + "    - 10.245.0.11\n"
+            + "    static:\n"
+            + "    - 10.245.0.12 - 10.245.0.99\n"
+            + "- type: replace\n"
+            + "  path: /vm_extensions/name=ssh-proxy-and-router-lb/cloud_properties/ports\n"
+            + "  value: [\"80\", \"443\", \"2222\"]\n"
+            + "- type: replace\n"
+            + "  path: /vm_extensions/name=cf-tcp-router-network-properties/cloud_properties?\n"
+            + "  value:\n"
+            + "    ports: []\n";
 
     private static final Pattern DETAIL_FILE_SHA = Pattern.compile("file_sha=([0-9a-f]{8,64})");
     private static final Pattern DETAIL_APPLIED_SHA = Pattern.compile("applied_sha=([0-9a-f]{8,64})");
@@ -149,8 +180,18 @@ public class UpdateCloudConfigStep implements SetupStep {
             + "BOSH_CLIENT_SECRET=\"$(./bin/bosh interpolate director-creds.yml --path /admin_password)\"\n"
             + "export BOSH_CLIENT BOSH_CLIENT_SECRET\n"
             + "\n"
-            + "echo \"[cloud-config] applying " + REMOTE_CLOUD_CONFIG + "\"\n"
-            + "./bin/bosh -e " + alias + " update-cloud-config " + REMOTE_CLOUD_CONFIG
+            + "cat > " + REMOTE_CLOUD_CONFIG_OVERRIDES + " <<'OPS'\n"
+            + CLOUD_CONFIG_OVERRIDES
+            + "OPS\n"
+            + "\n"
+            + "echo \"[cloud-config] rendering " + REMOTE_CLOUD_CONFIG + " + "
+                    + REMOTE_CLOUD_CONFIG_OVERRIDES + "\"\n"
+            + "./bin/bosh interpolate " + REMOTE_CLOUD_CONFIG
+                    + " -o " + REMOTE_CLOUD_CONFIG_OVERRIDES
+                    + " > " + REMOTE_CLOUD_CONFIG_RENDERED + "\n"
+            + "\n"
+            + "echo \"[cloud-config] applying " + REMOTE_CLOUD_CONFIG_RENDERED + "\"\n"
+            + "./bin/bosh -e " + alias + " update-cloud-config " + REMOTE_CLOUD_CONFIG_RENDERED
                     + " --no-color --non-interactive\n"
             + "\n"
             + "echo \"[cloud-config] verifying applied config on director\"\n"

@@ -46,12 +46,19 @@ public class SetupCommands {
             boolean verify,
             @Option(longName = "force",
                     description = "Run the step even if check() says ALREADY_DONE")
-            boolean force) throws Exception {
+            boolean force,
+            @Option(longName = "system-domain",
+                    description = "CF system domain (used by deploy-cf onward)",
+                    defaultValue = SetupContext.DEFAULT_SYSTEM_DOMAIN)
+            String systemDomain,
+            @Option(longName = "ignore-resource-check",
+                    description = "Bypass the deploy-cf 16 GiB RAM / 50 GiB disk precheck")
+            boolean ignoreResourceCheck) throws Exception {
 
         if (name == null || name.isBlank()) {
             return "ERROR: --name is required.\nKnown steps: " + String.join(", ", orchestrator.stepNames());
         }
-        SetupContext ctx = buildContext(host, remoteSocket, verify, force);
+        SetupContext ctx = buildContext(host, remoteSocket, verify, force, systemDomain, ignoreResourceCheck);
         StepResult result = orchestrator.runStep(name, ctx);
         return renderResult(ctx, name, result);
     }
@@ -66,19 +73,24 @@ public class SetupCommands {
                     defaultValue = "/var/run/docker.sock")
             String remoteSocket) throws Exception {
 
-        SetupContext ctx = buildContext(host, remoteSocket, false, false);
+        SetupContext ctx = buildContext(host, remoteSocket, false, false,
+                SetupContext.DEFAULT_SYSTEM_DOMAIN, false);
         Map<String, StepStatus> persisted = orchestrator.status(ctx);
         return renderStatus(ctx, orchestrator.stepNames(), persisted);
     }
 
-    private SetupContext buildContext(String host, String remoteSocket, boolean verify, boolean force) {
+    private SetupContext buildContext(String host, String remoteSocket, boolean verify, boolean force,
+                                      String systemDomain, boolean ignoreResourceCheck) {
         DockerTarget target = resolver.resolve(host, remoteSocket);
         String slug = HostSlug.from(target);
         Path home = Paths.get(System.getProperty("user.home"));
         Path stateDir = home.resolve(".cf-docker-cpi").resolve("hosts").resolve(slug);
         Path binDir = home.resolve(".cf-docker-cpi").resolve("bin");
         return new SetupContext(target, slug, stateDir, binDir, verify, force,
-                SetupContext.DEFAULT_DIRECTOR_IP, SetupContext.DEFAULT_INTERNAL_CIDR);
+                SetupContext.DEFAULT_DIRECTOR_IP, SetupContext.DEFAULT_INTERNAL_CIDR,
+                systemDomain == null || systemDomain.isBlank()
+                        ? SetupContext.DEFAULT_SYSTEM_DOMAIN : systemDomain,
+                ignoreResourceCheck);
     }
 
     private String renderResult(SetupContext ctx, String name, StepResult result) {
