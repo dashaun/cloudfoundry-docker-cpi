@@ -16,19 +16,29 @@ Wraps the existing `VerificationService` (also exposed standalone as `docker ver
 
 ## 2. `host-setup`
 
-Tune docker-host kernel limits that affect stemcell containers. Today this is just the `fs.inotify.*` knobs (see issue #14 for the symptom); the step is meant to absorb additional host-level prereqs as we find them.
+Tune docker-host kernel limits and AppArmor profiles that affect stemcell containers. Two concerns today (the step is meant to absorb additional host-level prereqs as they're discovered):
+
+1. `fs.inotify.*` sysctls (issue #14).
+2. The host's `nc.openbsd` AppArmor profile (issue #16 follow-up — discovered while running diego-cell on noble; details below).
 
 - **Inputs**: the SSH target.
-- **Outputs**: `/etc/sysctl.d/99-cf-docker-cpi.conf` on the docker host with `fs.inotify.max_user_instances = 8192` and `fs.inotify.max_user_watches = 65536`, plus a live `sysctl --load` so it takes effect immediately. The step only writes the dropin when current values are below the floor.
+- **Outputs**:
+  - `/etc/sysctl.d/99-cf-docker-cpi.conf` on the docker host with `fs.inotify.max_user_instances = 8192` and `fs.inotify.max_user_watches = 65536`, plus a live `sysctl --load` so it takes effect immediately. Only written when current values are below the floor.
+  - `/etc/apparmor.d/disable/nc.openbsd` symlink (or `usr.bin.nc.openbsd` on older Ubuntu) and a live `apparmor_parser -R` to unload the profile from the running kernel. Only applied when the profile is currently enforced.
 - **Cheap check**: status PASS exists.
-- **Deep check** (`--verify`): re-read `/proc/sys/fs/inotify/{max_user_instances,max_user_watches}` and confirm both meet the minimums.
+- **Deep check** (`--verify`): re-read `/proc/sys/fs/inotify/{max_user_instances,max_user_watches}` and re-probe AppArmor (`aa-status` + the disable/ symlink), confirm everything is still in place.
 - **Failure modes**:
-  - User lacks passwordless sudo on the docker host → the step prints the manual recipe (`sudo tee /etc/sysctl.d/99-cf-docker-cpi.conf ... && sudo sysctl --load=...`) and exits.
+  - User lacks passwordless sudo on the docker host → the step prints both manual recipes (sysctl and AppArmor) and exits.
   - Sysctl applied but the kernel reports values still below the floor (extremely unlikely; would mean another sysctl drop-in overrides ours).
+  - AppArmor: profile file path differs again in a future Ubuntu release. The step probes both `nc.openbsd` and `usr.bin.nc.openbsd` under `/etc/apparmor.d/`; a third name would require adding a candidate.
 
-### Why this step exists
+### Why the sysctl bit exists
 
 The Linux default `fs.inotify.max_user_instances = 128` is a per-uid host-wide cap. Every stemcell container runs its own systemd + journald + udevd, all as uid 0 which maps to the host's uid 0 (non-userns docker). With ~16 CF instance-group VMs the host's pool is exhausted; new processes inside late-starting containers get `EMFILE` from `inotify_init()`. systemd-udevd inside the container then crash-loops, and the BOSH agent fails to come back up after the CPI's apply-settings container restart. The director times out pinging the dead agent; the container itself stays `Up`. Bumping the per-uid cap to 8192 (the same value used by kubernetes/containerd reference setups) makes the pool effectively unbounded for our deploy.
+
+### Why the AppArmor bit exists
+
+Noble Ubuntu ships an AppArmor profile for `nc.openbsd` that denies the `dac_override` and `dac_read_search` capabilities. AppArmor profiles are kernel-global and apply to processes inside docker containers as well as host processes (the cell container shares the host kernel). cf-deployment's `garden/post-start` script pings garden via `echo … | nc -U /var/vcap/data/garden/garden.sock`. Inside the cell that `nc` invocation is confined by the host's profile and fails with `Permission denied`, even though the socket is mode `0777` and garden itself is up — `curl --unix-socket` to the same socket works because no AppArmor profile applies to `curl`. The garden post-start times out after 120 s, BOSH marks the canary `failing`, the deploy fails. Disabling the profile on the host (one-time, one symlink + `apparmor_parser -R`) is the smallest blast-radius fix; the profile has nothing to do with `nc`'s legitimate use cases and Ubuntu only ships it because nc.openbsd has a long history of CVEs.
 
 ## 3. `install-tools`
 
