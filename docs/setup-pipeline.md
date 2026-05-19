@@ -83,6 +83,18 @@ Write `director-vars.yml` with director IP, internal CIDR, and the runtime docke
   - Container resource limits insufficient → bosh CLI emits a clear error.
   - CPI can't reach docker → check `tls/` on the host and dockerd's TLS config (below).
   - Bootstrap exits 78 with `tls/ca.pem missing` → see "dockerd TLS prereq" below.
+  - `dial tcp 10.245.0.11:6868: i/o timeout` from the bosh CLI → on WSL2 docker hosts the `cf-docker-cpi-net` bridge isn't routable from the WSL shell by default. See "WSL2 routing prereq" below.
+
+### WSL2 routing prereq
+
+When the docker host is a WSL2 distro on Windows 11, the `cf-docker-cpi-net` bridge (`10.245.0.0/24`) is created inside Docker Desktop's helper VM and not exposed to the WSL2 shell. `bosh create-env` then can't reach `10.245.0.11:6868` to push the rest of the deployment. The fix is to enable WSL's mirrored networking mode on the Windows side (one-time host config; see the README's "WSL2 docker host notes" for the exact `.wslconfig` snippet and `wsl --shutdown` recipe). Verify on the docker host with:
+
+```bash
+ip route show | grep -E '10\.245|cf-docker'   # should print a route after the docker network is created
+nc -w3 -zv 10.245.0.11 6868                   # should connect once the director container is up
+```
+
+If you can't enable mirrored networking, this CLI doesn't currently have a workaround — see issue #13 for the rejected sidecar-container alternative.
 
 ### dockerd TLS prereq
 
