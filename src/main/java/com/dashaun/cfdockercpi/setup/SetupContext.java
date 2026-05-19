@@ -41,8 +41,4 @@ public record SetupContext(
     public Path newLogFile(String stepName) {
         return logsDir().resolve(stepName + "-" + LOG_TS.format(Instant.now()) + ".log");
     }
-
-    public Path cfHome() {
-        return stateDir.resolve("cf-home");
-    }
 }

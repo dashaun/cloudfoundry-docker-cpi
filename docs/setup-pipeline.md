@@ -211,46 +211,45 @@ cf-deployment v56.4.0's bosh-lite cloud-config emits three things that bosh-dock
 
 ## 12. `configure-cf-cli`
 
-Point the local `cf` CLI at the new Cloud Foundry, log in as admin, create the `system/dev` org & space. Uses an **isolated `CF_HOME` under `<state-dir>/cf-home`** so this tool never clobbers the user's existing `~/.cf`.
+Drive the `cf` CLI **on the docker host** (not the laptop) to target the new Cloud Foundry, log in as admin, and create the `system/dev` org & space. Issue #20 — the laptop-side design hit a wall at `cf auth`: cf re-fetches the UAA URL from `/v2/info` and that URL has no port, so it would dial `127.0.0.1:443` (no listener) instead of our `localhost:8443` tunnel. The docker host can reach the haproxy bridge IP `10.245.0.34:443` directly with no tunnel, so we just run cf there over SSH.
 
-- **Inputs**: local `cf` binary at `<bin-dir>/cf`, admin password from `<state-dir>/cf-creds.yml`, `system_domain`.
-- **Outputs**: `<state-dir>/cf-home/config.json` targeted at the new CF; `system` org with `dev` space; if missing, `/etc/hosts` rewritten (when `--write-hosts` is set).
-- **Cheap check**: status PASS exists AND `<state-dir>/cf-home/` exists.
-- **Deep check** (`--verify`): cheap check PLUS `cf target` (with the isolated `CF_HOME`) reads `api.<system_domain>` and org=system / space=dev.
+- **Inputs**: `<state-dir>/cf-creds.yml` (admin password from `deploy-cf`), `system_domain`, the ssh:// target.
+- **Outputs** (all on the docker host):
+  - `~/.cf-docker-cpi-work/bin/cf` — pinned cf 8.x, downloaded + SHA-checked on first run.
+  - `~/.cf-docker-cpi-work/cf-home/` — isolated `CF_HOME` so the docker-host user's own `~/.cf` is not clobbered.
+  - `/etc/hosts` block bracketed by `# cf-docker-cpi (configure-cf-cli)` / `# end cf-docker-cpi`, mapping six hostnames (`api`, `login`, `uaa`, `cf-smoke`, `log-cache`, `doppler`) under `<system_domain>` to `10.245.0.34`. Only written when `--write-hosts` is passed.
+  - `system` org + `dev` space inside the new CF.
+- **Cheap check**: status PASS exists.
+- **Deep check** (`--verify`): SSH to the host and run `~/.cf-docker-cpi-work/bin/cf target` with the persisted CF_HOME; confirm the API endpoint contains `api.<system_domain>` and org/space are `system/dev`.
 - **Failure modes**:
-  - `cf` binary missing → run install-tools.
   - `cf_admin_password` not in `cf-creds.yml` → deploy-cf didn't complete.
-  - Hostnames don't resolve locally → step exits with the exact `/etc/hosts` line; re-run with `--write-hosts` to apply it via `sudo tee -a`.
-  - SSH local-forward fails to bind `localhost:8443` → likely a stale tunnel from a prior run; kill it and retry (the step falls back to a random free port automatically).
+  - `/etc/hosts` block missing on the docker host → step exits with the manual recipe (heredoc) and `exit 78`. Re-run with `--write-hosts` (which uses `sudo -n` on the docker host, so the user needs passwordless sudo there).
   - cf API returns a 5xx during `cf auth` → director/router not fully up yet; re-run after a minute.
 
-### How the step reaches haproxy
+### Why six hostnames
 
-The cf-deployment haproxy/router is pinned to `10.245.0.34` on the `cf-docker-cpi-net` bridge (see `DeployCfStep.ROUTER_STATIC_IP`). Only the docker host itself sees that bridge directly. For local `cf` to reach it, the step opens an SSH local-forward `localhost:8443 → 10.245.0.34:443` (via `SshLocalForward`) for the duration of the cf commands. cf is then pointed at `https://api.<system_domain>:8443 --skip-ssl-validation`.
+cf-deployment routes through haproxy by `Host:` header, so anything `cf` (or `cf-smoke`) needs to reach has to resolve to `10.245.0.34`. The six are the minimum we observed during validation: `api` for the cloud-controller API, `login`/`uaa` for the OAuth flow, `log-cache`/`doppler` for `cf logs`/`cf push`'s log streaming, and `cf-smoke` for the smoke app's route.
 
-`/etc/hosts` is necessary on the laptop because cf uses the hostname (not the IP) when connecting and routing through haproxy. Required entries:
+### Password handling
 
-```
-127.0.0.1 api.<system_domain> login.<system_domain> uaa.<system_domain> cf-smoke.<system_domain>
-```
-
-`--write-hosts` shells out to `sudo tee -a /etc/hosts` (interactive password prompt) and adds the line bracketed by `# cf-docker-cpi (...)` markers so it's easy to find / remove later. Local resolution is verified again after the write before continuing.
-
-Gotcha (carried over from earlier docs): on WSL2 the docker daemon may not bind haproxy on `0.0.0.0` reliably. If localhost:8443 connects but every cf request hangs, the escape hatch is to `cf push` from a container colocated on the docker host via `bosh ssh diego-cell/0` and the `cf` binary copied into that container.
+The admin password is read locally from `cf-creds.yml`, embedded in a bash script body, piped over the ssh connection's stdin to `bash -s`, and exported as `CF_PASSWORD` for the duration of `cf auth` only. It's never on any argv (so it doesn't appear in `ps` either locally or on the docker host).
 
 ## 13. `smoke-push`
 
-Fetch a minimal Spring Boot web app from start.spring.io, build it locally with the project's bundled `mvnw`, `cf push` it through the same SSH local-forward, then HTTP-GET `/actuator/health` until it returns 200 (timeout 120 s).
+Build a Spring Boot starter locally (the laptop has `mvnw` and a JDK; the docker host typically doesn't), `scp` the jar to the docker host, then `cf push` and `curl /actuator/health` from there. Same docker-host-side architecture as configure-cf-cli.
 
-- **Inputs**: `<state-dir>/cf-home/` (configure-cf-cli ran), `<bin-dir>/cf`, `system_domain`.
-- **Outputs**: `<state-dir>/cf-smoke/` (extracted starter), `<state-dir>/cf-smoke/target/cf-smoke-*.jar`, `<state-dir>/cf-smoke/manifest.yml`, the `cf-smoke` app pushed to `system/dev`.
+- **Inputs**: `<state-dir>/cf-smoke/pom.xml` exists (skipped fetch) or fetched from start.spring.io; the `cf` binary and CF_HOME under `~/.cf-docker-cpi-work/` on the docker host.
+- **Outputs**:
+  - `<state-dir>/cf-smoke/` — extracted starter and `target/cf-smoke-*.jar` on the laptop.
+  - `~/.cf-docker-cpi-work/cf-smoke.jar` and `cf-smoke-manifest.yml` on the docker host.
+  - `cf-smoke` app pushed into `system/dev`.
 - **Cheap check**: status PASS exists.
-- **Deep check** (`--verify`): re-runs the step (push is idempotent — cf push will skip the upload if the bits match, and the health probe re-confirms).
+- **Deep check** (`--verify`): re-runs the step (cf push is idempotent — bits-match short-circuits the upload, and the health probe re-confirms).
 - **Failure modes**:
   - Spring Initializr unreachable → step exits with the HTTP status from `start.spring.io`.
-  - Build fails → look at the `[build]` block of the step log; usually a transient Maven Central / artifact-proxy issue, sometimes a Java version mismatch.
-  - `cf push` reports `failed` for the app → app instance crashed; `cf logs cf-smoke --recent` (with `CF_HOME=<state-dir>/cf-home`) shows the stack trace.
-  - HTTP probe times out → tunnel died mid-run (look for `ssh exited` lines), or the app is still warming up (raise `HEALTH_TIMEOUT_SECONDS`).
+  - Local build fails → see the `[build]` block of the step log.
+  - `cf push` reports `failed` for the app → `cf logs cf-smoke --recent` on the docker host (CF_HOME=~/.cf-docker-cpi-work/cf-home) shows the stack trace.
+  - HTTP probe times out → typically the app is still warming up; raise `HEALTH_TIMEOUT_SECONDS` if your laptop / app needs more time.
 
 The starter is fetched as:
 
@@ -267,4 +266,4 @@ https://start.spring.io/starter.zip
 
 actuator is included so we have a known-good `/actuator/health` URL to probe; `javaVersion=17` matches what java_buildpack v4.x+ supports. The generated manifest pins `JBP_CONFIG_OPEN_JDK_JRE: '{ jre: { version: 17.+ } }'` in `env:` to override the buildpack's JDK-8 default. If the step is re-run, the starter zip is *not* re-downloaded (the `pom.xml` presence check short-circuits) — `rm -rf <state-dir>/cf-smoke` to force a fresh fetch.
 
-The HTTP probe uses Java's `HttpClient` with a permissive `SSLContext` (the haproxy cert is self-signed and the connect goes through the local-forward tunnel — `--skip-ssl-validation` equivalent). Pollster polls every 3 s and tolerates `ConnectException` / `SSLException` / 502 / 503 as "still booting"; only a clean 200 wins.
+The HTTP probe is `curl -sk -o ...health.json -w '%{http_code}' --max-time 5 https://cf-smoke.<system_domain>/actuator/health` running on the docker host, where the route hostname resolves via `/etc/hosts` to `10.245.0.34`. Polls every 3 s for up to 120 s and tolerates non-200 responses (incl. `000` from connection failures) as "still booting"; only a clean 200 wins.
