@@ -28,6 +28,16 @@ public class UpdateRuntimeConfigStep implements SetupStep {
     static final String DNS_CONFIG_NAME = "dns";
     static final String DNS_WAIT_CONFIG_NAME = "dns-wait";
     static final String REMOTE_DNS_YML = "bosh-deployment/runtime-configs/dns.yml";
+    static final String DNS_RECURSORS_OPS_FILE = "dns-recursors-overrides.yml";
+    // bosh-deployment's dns.yml ships `disable_recursors: true` on the ubuntu-noble addon
+    // ("bosh-dns-systemd"), with empty `recursors`. On a stock cf-deployment that's fine —
+    // the host's recursive resolver picks up external names. On our docker-CPI deploy the
+    // cell VM's /etc/resolv.conf has been rewritten by dns-wait v0.2.0 to point at bosh-dns
+    // itself (169.254.0.2), so bosh-dns has nowhere to forward unknown names → SERVFAIL on
+    // anything off the cf-internal mesh, including the buildpacks.cloudfoundry.org domain
+    // the java_buildpack staging fetches the JRE from. Override both: enable recursion and
+    // hard-code a pair of public resolvers.
+    static final String[] DNS_RECURSORS = {"8.8.8.8", "1.1.1.1"};
 
     // Tiny in-repo BOSH release that gives diego-cell a pre-start hook waiting for
     // locket.service.cf.internal to resolve via libc before letting rep start.
@@ -160,8 +170,13 @@ public class UpdateRuntimeConfigStep implements SetupStep {
             + "BOSH_CLIENT_SECRET=\"$(./bin/bosh interpolate director-creds.yml --path /admin_password)\"\n"
             + "export BOSH_CLIENT BOSH_CLIENT_SECRET\n"
             + "\n"
-            + "echo \"[runtime-config] applying " + REMOTE_DNS_YML + " as name=" + DNS_CONFIG_NAME + "\"\n"
+            + "cat > " + DNS_RECURSORS_OPS_FILE + " <<'OPS'\n"
+            + dnsRecursorsOpsFile()
+            + "OPS\n"
+            + "\n"
+            + "echo \"[runtime-config] applying " + REMOTE_DNS_YML + " (+recursors ops) as name=" + DNS_CONFIG_NAME + "\"\n"
             + "./bin/bosh -e " + alias + " update-runtime-config " + REMOTE_DNS_YML
+                    + " -o " + DNS_RECURSORS_OPS_FILE
                     + " --name " + DNS_CONFIG_NAME + " --no-color --non-interactive\n"
             + "\n"
             + dnsWaitSection(alias)
@@ -173,6 +188,28 @@ public class UpdateRuntimeConfigStep implements SetupStep {
                     + " --no-color | sha256sum | awk '{print $1}')\"\n"
             + "echo \"" + DNS_SHA_MARKER + " ${DNS_APPLIED}\"\n"
             + "echo \"" + DNS_WAIT_SHA_MARKER + " ${DNS_WAIT_APPLIED}\"\n";
+    }
+
+    private static String dnsRecursorsOpsFile() {
+        // The noble addon in upstream dns.yml is named `bosh-dns-systemd` (it co-locates a
+        // `configure_systemd_resolved: true` so libc on noble goes through systemd-resolved
+        // → bosh-dns). On a docker-CPI deploy that pairing is what dns-wait v0.2.0 has to
+        // unwind, and once /etc/resolv.conf no longer points at systemd-resolved's stub,
+        // bosh-dns has nothing upstream to forward unknown names to. Override both knobs
+        // on that addon. `?` after disable_recursors creates the key if upstream renames
+        // or drops it; the addon-name path itself uses `=` so it must match exactly.
+        StringBuilder recursors = new StringBuilder();
+        for (String r : DNS_RECURSORS) {
+            recursors.append("    - ").append(r).append('\n');
+        }
+        return ""
+            + "- type: replace\n"
+            + "  path: /addons/name=bosh-dns-systemd/jobs/name=bosh-dns/properties/disable_recursors?\n"
+            + "  value: false\n"
+            + "- type: replace\n"
+            + "  path: /addons/name=bosh-dns-systemd/jobs/name=bosh-dns/properties/recursors?\n"
+            + "  value:\n"
+            + recursors.toString();
     }
 
     private String dnsWaitSection(String alias) {
