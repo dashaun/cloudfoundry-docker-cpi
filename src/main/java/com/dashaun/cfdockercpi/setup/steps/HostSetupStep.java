@@ -31,6 +31,16 @@ public class HostSetupStep implements SetupStep {
     // The per-uid watch pool is shared the same way; the default of 8192 is also too low for
     // a CF-on-docker host. 65536 is a generous floor that most modern distros already meet.
     static final long MIN_INOTIFY_WATCHES = 65536;
+    // Noble ships an AppArmor profile for nc.openbsd that denies dac_override/dac_read_search.
+    // garden's post-start probe shells `nc -U /var/vcap/data/garden/garden.sock` to ping garden;
+    // the profile is enforced inside the diego-cell container too, so the probe fails with
+    // "Permission denied" even though garden itself is up. Disabling the host profile is the
+    // smallest blast-radius fix (curl --unix-socket is unaffected because no profile applies).
+    // See deploy-cf #16 follow-up. The on-disk filename varies across releases — on noble it
+    // is /etc/apparmor.d/nc.openbsd; older Ubuntu used /etc/apparmor.d/usr.bin.nc.openbsd. We
+    // discover it at runtime rather than hardcoding.
+    static final String APPARMOR_DIR = "/etc/apparmor.d";
+    static final String APPARMOR_DISABLE_DIR = APPARMOR_DIR + "/disable";
 
     private final StatusStore statusStore;
 
@@ -84,35 +94,142 @@ public class HostSetupStep implements SetupStep {
             header(logOut, ctx, before, required);
 
             Map<String, Long> toRaise = belowFloor(before, required);
+            ApparmorState apparmor = probeNcApparmor(ctx);
+            logOut.write("[host-setup] nc.openbsd AppArmor profile: " + apparmor + "\n");
+
+            String sysctlSummary;
             if (toRaise.isEmpty()) {
-                String summary = "inotify limits OK (" + format(before) + ")";
                 logOut.write("[host-setup] all sysctls already meet minimums; nothing to do.\n");
-                statusStore.put(ctx.statusFile(), NAME, StepStatus.pass(summary));
-                return StepResult.ran(summary + " (log: " + logFile + ")");
+                sysctlSummary = "inotify limits OK (" + format(before) + ")";
+            } else {
+                logOut.write("[host-setup] raising: " + format(toRaise) + "\n");
+                String script = applyScript(toRaise);
+                int exit = streamRemote(ctx, script, logOut);
+                if (exit != 0) {
+                    String detail = "sudo apply failed (exit " + exit + "). "
+                            + "The user must have passwordless sudo on the docker host, or run manually:"
+                            + manualRecipe(required);
+                    statusStore.put(ctx.statusFile(), NAME, StepStatus.fail(detail));
+                    return StepResult.failed(detail + " (log: " + logFile + ")");
+                }
+                Map<String, Long> after = readSysctls(ctx);
+                logOut.write("\n[host-setup] post-apply: " + format(after) + "\n");
+                if (!allMet(after, required)) {
+                    String detail = "sysctl applied (exit 0) but values still below minimums: " + format(after);
+                    statusStore.put(ctx.statusFile(), NAME, StepStatus.fail(detail));
+                    return StepResult.failed(detail + " (log: " + logFile + ")");
+                }
+                sysctlSummary = "inotify limits bumped (was: " + format(before) + " -> now: " + format(after) + ")";
             }
-            logOut.write("[host-setup] raising: " + format(toRaise) + "\n");
 
-            String script = applyScript(toRaise);
-            int exit = streamRemote(ctx, script, logOut);
-            if (exit != 0) {
-                String detail = "sudo apply failed (exit " + exit + "). "
-                        + "The user must have passwordless sudo on the docker host, or run manually:"
-                        + manualRecipe(required);
-                statusStore.put(ctx.statusFile(), NAME, StepStatus.fail(detail));
-                return StepResult.failed(detail + " (log: " + logFile + ")");
+            String apparmorSummary;
+            if (apparmor == ApparmorState.NOT_PRESENT) {
+                apparmorSummary = "nc.openbsd profile not present (no action needed)";
+            } else if (apparmor == ApparmorState.ALREADY_DISABLED) {
+                apparmorSummary = "nc.openbsd already disabled";
+            } else {
+                logOut.write("[host-setup] disabling nc.openbsd AppArmor profile under " + APPARMOR_DIR + "\n");
+                int exit = streamRemote(ctx, disableNcApparmorScript(), logOut);
+                if (exit != 0) {
+                    String detail = "disabling nc.openbsd AppArmor profile failed (exit " + exit + "). "
+                            + "Run manually:" + manualApparmorRecipe();
+                    statusStore.put(ctx.statusFile(), NAME, StepStatus.fail(detail));
+                    return StepResult.failed(detail + " (log: " + logFile + ")");
+                }
+                ApparmorState after = probeNcApparmor(ctx);
+                if (after != ApparmorState.ALREADY_DISABLED) {
+                    String detail = "nc.openbsd disable script succeeded but profile still loaded (state=" + after + ")";
+                    statusStore.put(ctx.statusFile(), NAME, StepStatus.fail(detail));
+                    return StepResult.failed(detail + " (log: " + logFile + ")");
+                }
+                apparmorSummary = "nc.openbsd AppArmor profile disabled";
             }
 
-            Map<String, Long> after = readSysctls(ctx);
-            logOut.write("\n[host-setup] post-apply: " + format(after) + "\n");
-            if (!allMet(after, required)) {
-                String detail = "sysctl applied (exit 0) but values still below minimums: " + format(after);
-                statusStore.put(ctx.statusFile(), NAME, StepStatus.fail(detail));
-                return StepResult.failed(detail + " (log: " + logFile + ")");
-            }
-            String summary = "inotify limits bumped (was: " + format(before) + " -> now: " + format(after) + ")";
+            String summary = sysctlSummary + "; " + apparmorSummary;
             statusStore.put(ctx.statusFile(), NAME, StepStatus.pass(summary));
             return StepResult.ran(summary + " (log: " + logFile + ")");
         }
+    }
+
+    enum ApparmorState {
+        NOT_PRESENT,         // /etc/apparmor.d/usr.bin.nc.openbsd doesn't exist on host
+        ALREADY_DISABLED,    // disabled/* symlink exists AND not in active profile list
+        ENFORCED             // active in /sys/kernel/security/apparmor/profiles or aa-status
+    }
+
+    private ApparmorState probeNcApparmor(SetupContext ctx) throws IOException, InterruptedException {
+        // Outputs:
+        //   PROFILE_FILE=<path|>     — first existing profile file (or empty)
+        //   LINK_OK=yes|no           — disable/* symlink for that basename present
+        //   ACTIVE=yes|no            — profile currently loaded into the kernel
+        // Both Ubuntu naming conventions are checked (noble uses bare nc.openbsd; older releases
+        // used usr.bin.nc.openbsd). aa-status sometimes needs sudo; we tolerate either.
+        String script = "set -uo pipefail\n"
+                + "PROFILE=\"\"\n"
+                + "for cand in " + APPARMOR_DIR + "/nc.openbsd " + APPARMOR_DIR + "/usr.bin.nc.openbsd; do\n"
+                + "  if [ -f \"$cand\" ]; then PROFILE=\"$cand\"; break; fi\n"
+                + "done\n"
+                + "echo PROFILE_FILE=$PROFILE\n"
+                + "if [ -n \"$PROFILE\" ] && [ -L " + APPARMOR_DISABLE_DIR + "/\"$(basename $PROFILE)\" ]; then\n"
+                + "  echo LINK_OK=yes\n"
+                + "else\n"
+                + "  echo LINK_OK=no\n"
+                + "fi\n"
+                + "if (command -v aa-status >/dev/null 2>&1 && sudo -n aa-status 2>/dev/null | grep -q '^   nc.openbsd$') \\\n"
+                + "    || (grep -q '^nc.openbsd ' /sys/kernel/security/apparmor/profiles 2>/dev/null); then\n"
+                + "  echo ACTIVE=yes\n"
+                + "else\n"
+                + "  echo ACTIVE=no\n"
+                + "fi\n";
+        Process p = startSshBash(ctx);
+        try (var stdin = p.getOutputStream()) {
+            stdin.write(script.getBytes(StandardCharsets.UTF_8));
+        }
+        byte[] out = p.getInputStream().readAllBytes();
+        p.waitFor();
+        String text = new String(out, StandardCharsets.UTF_8);
+        boolean fileFound = false;
+        for (String line : text.split("\n")) {
+            if (line.startsWith("PROFILE_FILE=") && line.length() > "PROFILE_FILE=".length()) {
+                fileFound = true;
+            }
+        }
+        boolean link = text.contains("LINK_OK=yes");
+        boolean active = text.contains("ACTIVE=yes");
+        if (!fileFound && !active) return ApparmorState.NOT_PRESENT;
+        if (link && !active) return ApparmorState.ALREADY_DISABLED;
+        return ApparmorState.ENFORCED;
+    }
+
+    private String disableNcApparmorScript() {
+        return "set -euo pipefail\n"
+                + "PROFILE=\"\"\n"
+                + "for cand in " + APPARMOR_DIR + "/nc.openbsd " + APPARMOR_DIR + "/usr.bin.nc.openbsd; do\n"
+                + "  if [ -f \"$cand\" ]; then PROFILE=\"$cand\"; break; fi\n"
+                + "done\n"
+                + "if [ -z \"$PROFILE\" ]; then\n"
+                + "  echo '[apparmor] no nc.openbsd profile file found; nothing to disable'; exit 0\n"
+                + "fi\n"
+                + "BASENAME=\"$(basename \"$PROFILE\")\"\n"
+                + "echo \"[apparmor] symlinking " + APPARMOR_DISABLE_DIR + "/$BASENAME -> $PROFILE\"\n"
+                + "sudo -n install -d -m 0755 " + APPARMOR_DISABLE_DIR + "\n"
+                + "# Clean up any stale broken symlinks from earlier runs that guessed the wrong basename.\n"
+                + "for stale in " + APPARMOR_DISABLE_DIR + "/nc.openbsd " + APPARMOR_DISABLE_DIR + "/usr.bin.nc.openbsd; do\n"
+                + "  if [ \"$stale\" != \"" + APPARMOR_DISABLE_DIR + "/$BASENAME\" ] && [ -L \"$stale\" ] && [ ! -e \"$stale\" ]; then\n"
+                + "    echo \"[apparmor] removing stale broken symlink $stale\"\n"
+                + "    sudo -n rm -f \"$stale\"\n"
+                + "  fi\n"
+                + "done\n"
+                + "sudo -n ln -sf \"$PROFILE\" \"" + APPARMOR_DISABLE_DIR + "/$BASENAME\"\n"
+                + "echo \"[apparmor] apparmor_parser -R $PROFILE\"\n"
+                + "sudo -n apparmor_parser -R \"$PROFILE\"\n";
+    }
+
+    private String manualApparmorRecipe() {
+        return "\n  PROFILE=$(ls " + APPARMOR_DIR + "/nc.openbsd " + APPARMOR_DIR + "/usr.bin.nc.openbsd 2>/dev/null | head -1)\n"
+                + "  sudo install -d -m 0755 " + APPARMOR_DISABLE_DIR + "\n"
+                + "  sudo ln -sf \"$PROFILE\" " + APPARMOR_DISABLE_DIR + "/$(basename \"$PROFILE\")\n"
+                + "  sudo apparmor_parser -R \"$PROFILE\"\n";
     }
 
     private Map<String, Long> readSysctls(SetupContext ctx) throws IOException, InterruptedException {
