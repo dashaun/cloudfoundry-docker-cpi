@@ -1,12 +1,12 @@
 package com.dashaun.cfdockercpi.setup.steps;
 
-import com.dashaun.cfdockercpi.docker.SshLocalForward;
 import com.dashaun.cfdockercpi.setup.SetupContext;
 import com.dashaun.cfdockercpi.setup.SetupStep;
 import com.dashaun.cfdockercpi.setup.StatusStore;
 import com.dashaun.cfdockercpi.setup.StepCheck;
 import com.dashaun.cfdockercpi.setup.StepResult;
 import com.dashaun.cfdockercpi.setup.StepStatus;
+import com.dashaun.cfdockercpi.tooling.ToolingVersions;
 import org.springframework.stereotype.Component;
 
 import java.io.BufferedReader;
@@ -14,21 +14,21 @@ import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.net.InetAddress;
-import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+// Targets cf at the CF deployed by deploy-cf, running cf *on the docker host* (not the laptop).
+//
+// Why on the docker host: the cf-deployment haproxy/router only honors hostnames mapped to
+// 10.245.0.34 (the bridge IP) on default ports (80/443). The laptop-side design (SSH local-
+// forward to localhost:8443, /etc/hosts to 127.0.0.1) breaks at `cf auth` because cf
+// rediscovers the UAA URL from /v2/info without our `:8443` port → connection refused. The
+// docker host can reach 10.245.0.34:443 directly with no tunnel. Issue #20.
 @Component
 public class ConfigureCfCliStep implements SetupStep {
 
@@ -36,10 +36,24 @@ public class ConfigureCfCliStep implements SetupStep {
     static final String CF_ORG = "system";
     static final String CF_SPACE = "dev";
     static final String HAPROXY_VM_IP = "10.245.0.34";  // matches DeployCfStep.ROUTER_STATIC_IP
-    static final int HAPROXY_PORT = 443;
-    static final int PREFERRED_LOCAL_PORT = 8443;
-    static final String SMOKE_APP_HOSTNAME = "cf-smoke";
-    static final String[] HOST_PREFIXES = {"api", "login", "uaa", SMOKE_APP_HOSTNAME};
+    static final String REMOTE_WORK_DIR = ".cf-docker-cpi-work";
+    static final String REMOTE_CF_BIN = REMOTE_WORK_DIR + "/bin/cf";
+    static final String REMOTE_CF_HOME = REMOTE_WORK_DIR + "/cf-home";
+    // cf-deployment routes by Host: header through haproxy on :443, so each hostname that the
+    // local cf and `cf push`'d apps need to reach must resolve to the bridge IP.
+    static final String[] HOST_PREFIXES = {
+            "api", "login", "uaa", "cf-smoke", "log-cache", "doppler"
+    };
+    static final String HOSTS_MARKER_BEGIN = "# cf-docker-cpi (configure-cf-cli)";
+    static final String HOSTS_MARKER_END = "# end cf-docker-cpi";
+
+    // Pinned linux/amd64 cf 8.x archive. verify-docker validates the host is linux/x86_64,
+    // so hardcoding the linux tarball is safe.
+    private static final String CF_LINUX_AMD64_URL =
+            "https://github.com/cloudfoundry/cli/releases/download/v" + ToolingVersions.CF_VERSION
+                    + "/cf8-cli_" + ToolingVersions.CF_VERSION + "_linux_x86-64.tgz";
+    private static final String CF_LINUX_AMD64_SHA =
+            "8942e2c3c98e83c7e14edbce939876bba7ff12a26f0f722c5aa5b079d357d50b";
 
     private static final Pattern CF_ADMIN_PW =
             Pattern.compile("(?m)^cf_admin_password:\\s+(\\S+)");
@@ -63,7 +77,8 @@ public class ConfigureCfCliStep implements SetupStep {
 
     @Override
     public String description() {
-        return "Point cf at the new Cloud Foundry, log in as admin, create the system/dev org & space.";
+        return "On the docker host: download cf, seed /etc/hosts, target the new CF, log in as "
+                + "admin, create the system/dev org & space.";
     }
 
     @Override
@@ -77,16 +92,12 @@ public class ConfigureCfCliStep implements SetupStep {
         if (recorded.isEmpty() || recorded.get().status() != StepStatus.Status.PASS) {
             return StepCheck.NEEDS_RUN;
         }
-        if (!Files.isDirectory(ctx.cfHome())) {
-            return StepCheck.NEEDS_RUN;
-        }
         if (ctx.verify()) {
-            Path cfBin = ctx.binDir().resolve("cf");
-            if (!Files.isRegularFile(cfBin)) return StepCheck.NEEDS_RUN;
+            if (!ctx.target().isSsh()) return StepCheck.NEEDS_RUN;
             try {
-                CfResult out = runCf(cfBin, ctx.cfHome(), Map.of(), null, "target");
-                if (out.exit != 0) return StepCheck.NEEDS_RUN;
-                if (!targetMatches(out.stdout, ctx)) return StepCheck.NEEDS_RUN;
+                CapturedRun r = runRemote(ctx, verifyScript());
+                if (r.exit != 0) return StepCheck.NEEDS_RUN;
+                if (!targetMatches(r.output, ctx)) return StepCheck.NEEDS_RUN;
             } catch (IOException | InterruptedException e) {
                 return StepCheck.NEEDS_RUN;
             }
@@ -97,17 +108,11 @@ public class ConfigureCfCliStep implements SetupStep {
     @Override
     public StepResult run(SetupContext ctx) throws IOException, InterruptedException {
         if (!ctx.target().isSsh()) {
-            return StepResult.failed("configure-cf-cli v1 supports ssh:// targets only; got " + ctx.target().uri());
+            return StepResult.failed("configure-cf-cli v2 supports ssh:// targets only; got " + ctx.target().uri());
         }
-
         Path logFile = ctx.newLogFile(NAME);
         Files.createDirectories(logFile.getParent());
 
-        Path cfBin = ctx.binDir().resolve("cf");
-        if (!Files.isRegularFile(cfBin) || !Files.isExecutable(cfBin)) {
-            return failPrecheck(ctx, logFile, "cf binary missing or not executable at "
-                    + cfBin + " — run install-tools");
-        }
         Path creds = ctx.stateDir().resolve("cf-creds.yml");
         String adminPw = readAdminPassword(creds);
         if (adminPw == null) {
@@ -115,186 +120,175 @@ public class ConfigureCfCliStep implements SetupStep {
                     + " — run deploy-cf");
         }
 
-        List<String> hostnames = expandHostnames(ctx.systemDomain());
-        List<String> unresolved = unresolvedHostnames(hostnames);
-        if (!unresolved.isEmpty()) {
-            String hostsLine = "127.0.0.1 " + String.join(" ", hostnames);
-            if (ctx.writeHosts()) {
-                try {
-                    writeHostsEntries(hostnames, logFile);
-                } catch (IOException e) {
-                    return failPrecheck(ctx, logFile, "--write-hosts failed: " + e.getMessage()
-                            + "\n  Add manually: " + hostsLine);
-                }
-                unresolved = unresolvedHostnames(hostnames);
-                if (!unresolved.isEmpty()) {
-                    return failPrecheck(ctx, logFile, "wrote /etc/hosts but " + unresolved
-                            + " still don't resolve (DNS cache?). Try again.");
-                }
-            } else {
-                return failPrecheck(ctx, logFile, "hostnames not resolvable: " + unresolved
-                        + "\n  Add to /etc/hosts:  " + hostsLine
-                        + "\n  Or re-run with --write-hosts");
-            }
-        }
-
-        Files.createDirectories(ctx.cfHome());
-
         try (BufferedWriter logOut = Files.newBufferedWriter(logFile)) {
-            header(logOut, ctx, cfBin);
-            try (SshLocalForward fwd = SshLocalForward.open(ctx.target(),
-                    HAPROXY_VM_IP, HAPROXY_PORT, PREFERRED_LOCAL_PORT, Duration.ofSeconds(10))) {
-                logOut.write("Tunnel:    " + fwd.description() + "\n\n");
-                logOut.flush();
-
-                int port = fwd.localPort();
-                String apiUrl = "https://api." + ctx.systemDomain() + ":" + port;
-
-                exec(cfBin, ctx.cfHome(), Map.of(), null, logOut,
-                        "api", apiUrl, "--skip-ssl-validation");
-
-                Map<String, String> authEnv = new LinkedHashMap<>();
-                authEnv.put("CF_USERNAME", "admin");
-                authEnv.put("CF_PASSWORD", adminPw);
-                exec(cfBin, ctx.cfHome(), authEnv, null, logOut, "auth");
-
-                ensureOrg(cfBin, ctx, logOut, CF_ORG);
-                ensureSpace(cfBin, ctx, logOut, CF_ORG, CF_SPACE);
-
-                exec(cfBin, ctx.cfHome(), Map.of(), null, logOut,
-                        "target", "-o", CF_ORG, "-s", CF_SPACE);
+            header(logOut, ctx);
+            String script = bootstrapScript(ctx, adminPw);
+            int exit = streamRemote(ctx, script, logOut);
+            if (exit != 0) {
+                String detail = "configure-cf-cli failed (ssh exit " + exit + ")";
+                statusStore.put(ctx.statusFile(), NAME, StepStatus.fail(detail));
+                return StepResult.failed(detail + " (log: " + logFile + ")");
             }
-        } catch (StepFailure e) {
-            statusStore.put(ctx.statusFile(), NAME, StepStatus.fail(e.detail));
-            return StepResult.failed(e.detail + " (log: " + logFile + ")");
         }
 
-        String summary = "cf targeted https://api." + ctx.systemDomain() + ":" + PREFERRED_LOCAL_PORT
-                + " (org=" + CF_ORG + " space=" + CF_SPACE + " CF_HOME=" + ctx.cfHome() + ")";
+        String summary = "cf targeted https://api." + ctx.systemDomain()
+                + " (org=" + CF_ORG + " space=" + CF_SPACE
+                + " remote CF_HOME=~/" + REMOTE_CF_HOME + ")";
         statusStore.put(ctx.statusFile(), NAME, StepStatus.pass(summary));
         return StepResult.ran(summary + " (log: " + logFile + ")");
     }
 
-    private void ensureOrg(Path cfBin, SetupContext ctx, BufferedWriter logOut, String org)
-            throws IOException, InterruptedException, StepFailure {
-        CfResult orgs = runCf(cfBin, ctx.cfHome(), Map.of(), null, "orgs");
-        if (orgs.exit != 0) {
-            logOut.write(orgs.stdout);
-            logOut.flush();
-            throw new StepFailure("cf orgs failed (exit " + orgs.exit + ")");
-        }
-        if (containsLineEqualling(orgs.stdout, org)) {
-            logOut.write("[org] '" + org + "' already exists; skipping create-org\n");
-            logOut.flush();
-            return;
-        }
-        exec(cfBin, ctx.cfHome(), Map.of(), null, logOut, "create-org", org);
+    private String bootstrapScript(SetupContext ctx, String adminPw) {
+        String hostsLine = HAPROXY_VM_IP + " "
+                + String.join(" ", expandHostnames(ctx.systemDomain()));
+        String hostsBlock = HOSTS_MARKER_BEGIN + "\n" + hostsLine + "\n" + HOSTS_MARKER_END;
+        String apiUrl = "https://api." + ctx.systemDomain();
+        // --write-hosts gates a `sudo tee -a /etc/hosts`. Without it, the step prints the line
+        // the user should add by hand and exits 78. (Same pattern as host-setup's sudo recipe.)
+        return "set -euo pipefail\n"
+            + "mkdir -p ~/" + REMOTE_WORK_DIR + "/bin ~/" + REMOTE_CF_HOME + "\n"
+            + "cd ~/" + REMOTE_WORK_DIR + "\n"
+            + "\n"
+            + installCfStanza()
+            + "\n"
+            + ensureHostsStanza(ctx, hostsBlock)
+            + "\n"
+            + "export CF_HOME=\"$(pwd)/cf-home\"\n"
+            + "export CF_COLOR=false\n"
+            + "echo \"[cf] api " + apiUrl + " --skip-ssl-validation\"\n"
+            + "./bin/cf api " + apiUrl + " --skip-ssl-validation >/dev/null\n"
+            + "\n"
+            + "echo \"[cf] auth admin (CF_PASSWORD piped via env from local cf-creds.yml)\"\n"
+            // The admin password gets to the remote via the bash script body, never on the
+            // `ssh` argv, so it doesn't show up in `ps`. CF_PASSWORD is briefly in this bash
+            // process's environment until `unset` after `cf auth` returns.
+            + "export CF_USERNAME=admin\n"
+            + "export CF_PASSWORD='" + escapeSingleQuoted(adminPw) + "'\n"
+            + "./bin/cf auth >/dev/null\n"
+            + "unset CF_PASSWORD CF_USERNAME\n"
+            + "\n"
+            // cf 8.x dropped the global `--no-color` flag (CF_COLOR=false handles it now)
+            // and `cf spaces -o ORG` (you target the org first, then `cf spaces` lists that
+            // org's spaces only). Target → list → create-if-missing → final target.
+            + "if ./bin/cf orgs | awk '{print $1}' | grep -qx " + CF_ORG + "; then\n"
+            + "  echo \"[cf] org " + CF_ORG + " already exists\"\n"
+            + "else\n"
+            + "  echo \"[cf] create-org " + CF_ORG + "\"\n"
+            + "  ./bin/cf create-org " + CF_ORG + " >/dev/null\n"
+            + "fi\n"
+            + "./bin/cf target -o " + CF_ORG + " >/dev/null\n"
+            + "\n"
+            + "if ./bin/cf spaces | awk '{print $1}' | grep -qx " + CF_SPACE + "; then\n"
+            + "  echo \"[cf] space " + CF_SPACE + " already exists in " + CF_ORG + "\"\n"
+            + "else\n"
+            + "  echo \"[cf] create-space " + CF_SPACE + " in " + CF_ORG + "\"\n"
+            + "  ./bin/cf create-space " + CF_SPACE + " >/dev/null\n"
+            + "fi\n"
+            + "\n"
+            + "echo \"[cf] target -o " + CF_ORG + " -s " + CF_SPACE + "\"\n"
+            + "./bin/cf target -o " + CF_ORG + " -s " + CF_SPACE + "\n";
     }
 
-    private void ensureSpace(Path cfBin, SetupContext ctx, BufferedWriter logOut,
-                             String org, String space)
-            throws IOException, InterruptedException, StepFailure {
-        CfResult spaces = runCf(cfBin, ctx.cfHome(), Map.of(), null, "spaces", "-o", org);
-        if (spaces.exit != 0) {
-            logOut.write(spaces.stdout);
-            logOut.flush();
-            throw new StepFailure("cf spaces -o " + org + " failed (exit " + spaces.exit + ")");
-        }
-        if (containsLineEqualling(spaces.stdout, space)) {
-            logOut.write("[space] '" + space + "' already exists in '" + org + "'; skipping create-space\n");
-            logOut.flush();
-            return;
-        }
-        exec(cfBin, ctx.cfHome(), Map.of(), null, logOut, "create-space", space, "-o", org);
+    private String installCfStanza() {
+        return ""
+            + "CF_PINNED='" + ToolingVersions.CF_VERSION + "'\n"
+            + "if ! [ -x ./bin/cf ] || ! ./bin/cf --version 2>/dev/null | grep -q \"$CF_PINNED\"; then\n"
+            + "  echo \"[bootstrap] downloading cf-cli " + ToolingVersions.CF_VERSION + "\"\n"
+            + "  ( tmpdir=$(mktemp -d) && cd \"$tmpdir\" \\\n"
+            + "    && curl -fsSL -o cf.tgz '" + CF_LINUX_AMD64_URL + "' \\\n"
+            + "    && echo '" + CF_LINUX_AMD64_SHA + "  cf.tgz' | sha256sum -c - \\\n"
+            + "    && tar -xzf cf.tgz cf8 \\\n"
+            + "    && install -m 0755 cf8 \"$OLDPWD/bin/cf\" \\\n"
+            + "    && cd \"$OLDPWD\" && rm -rf \"$tmpdir\" )\n"
+            + "fi\n"
+            + "echo \"[bootstrap] cf: $(./bin/cf --version)\"\n";
     }
 
-    private void exec(Path cfBin, Path cfHome, Map<String, String> env, String stdin,
-                      BufferedWriter logOut, String... args)
-            throws IOException, InterruptedException, StepFailure {
-        logOut.write("$ cf " + String.join(" ", args) + "\n");
-        logOut.flush();
-        CfResult r = runCf(cfBin, cfHome, env, stdin, args);
-        logOut.write(r.stdout);
-        if (!r.stdout.endsWith("\n")) logOut.write("\n");
-        logOut.flush();
-        if (r.exit != 0) {
-            throw new StepFailure("cf " + args[0] + " failed (exit " + r.exit + ")");
+    private String ensureHostsStanza(SetupContext ctx, String hostsBlock) {
+        // grep -F + the canonical line; only act when it's missing AND --write-hosts was passed.
+        String canonical = HAPROXY_VM_IP + " api." + ctx.systemDomain();
+        if (ctx.writeHosts()) {
+            return ""
+                + "if ! grep -Fq '" + canonical + "' /etc/hosts; then\n"
+                + "  echo \"[hosts] adding cf-docker-cpi block to /etc/hosts (sudo)\"\n"
+                + "  printf '\\n%s\\n' '" + escapeSingleQuoted(hostsBlock) + "' | sudo -n tee -a /etc/hosts >/dev/null\n"
+                + "else\n"
+                + "  echo \"[hosts] /etc/hosts already contains '" + canonical + "'\"\n"
+                + "fi\n";
         }
+        // No write flag: probe and bail with the exact line if missing.
+        return ""
+            + "if ! grep -Fq '" + canonical + "' /etc/hosts; then\n"
+            + "  echo \"ERROR: /etc/hosts on the docker host is missing the cf hostname mapping.\"\n"
+            + "  echo \"       Re-run configure-cf-cli with --write-hosts (passwordless sudo required\"\n"
+            + "  echo \"       on the docker host), or add manually:\"\n"
+            + "  echo\n"
+            + "  echo \"  sudo tee -a /etc/hosts >/dev/null <<'HOSTS'\"\n"
+            + "  echo\n"
+            + "  echo '" + escapeSingleQuoted(hostsBlock) + "'\n"
+            + "  echo\n"
+            + "  echo \"HOSTS\"\n"
+            + "  exit 78\n"
+            + "else\n"
+            + "  echo \"[hosts] /etc/hosts on the docker host already maps " + canonical + "\"\n"
+            + "fi\n";
     }
 
-    private CfResult runCf(Path cfBin, Path cfHome, Map<String, String> env, String stdin,
-                           String... args) throws IOException, InterruptedException {
-        List<String> cmd = new ArrayList<>();
-        cmd.add(cfBin.toString());
-        for (String a : args) cmd.add(a);
-        ProcessBuilder pb = new ProcessBuilder(cmd).redirectErrorStream(true);
-        pb.environment().put("CF_HOME", cfHome.toString());
-        pb.environment().put("CF_COLOR", "false");
-        pb.environment().putAll(env);
-        Process p = pb.start();
-        if (stdin != null) {
-            try (var out = p.getOutputStream()) {
-                out.write(stdin.getBytes(StandardCharsets.UTF_8));
-            }
-        } else {
-            p.getOutputStream().close();
-        }
-        byte[] body;
-        try (InputStream in = p.getInputStream()) {
-            body = in.readAllBytes();
-        }
-        return new CfResult(p.waitFor(), new String(body, StandardCharsets.UTF_8));
+    private String verifyScript() {
+        return "set -euo pipefail\n"
+            + "cd ~/" + REMOTE_WORK_DIR + "\n"
+            + "[ -x ./bin/cf ] || exit 64\n"
+            + "[ -d cf-home ] || exit 65\n"
+            + "export CF_HOME=\"$(pwd)/cf-home\" CF_COLOR=false\n"
+            + "./bin/cf target\n";
     }
 
-    static List<String> expandHostnames(String systemDomain) {
-        List<String> out = new ArrayList<>();
+    static java.util.List<String> expandHostnames(String systemDomain) {
+        java.util.List<String> out = new java.util.ArrayList<>();
         for (String pref : HOST_PREFIXES) out.add(pref + "." + systemDomain);
         return out;
     }
 
-    private List<String> unresolvedHostnames(List<String> hostnames) {
-        List<String> missing = new ArrayList<>();
-        for (String h : hostnames) {
-            try {
-                InetAddress.getByName(h);
-            } catch (UnknownHostException e) {
-                missing.add(h);
-            }
+    private CapturedRun runRemote(SetupContext ctx, String script)
+            throws IOException, InterruptedException {
+        Process p = startSshBash(ctx);
+        try (var stdin = p.getOutputStream()) {
+            stdin.write(script.getBytes(StandardCharsets.UTF_8));
         }
-        return missing;
+        byte[] out = p.getInputStream().readAllBytes();
+        return new CapturedRun(p.waitFor(), new String(out, StandardCharsets.UTF_8));
     }
 
-    // Appends the consolidated hosts line via `sudo tee -a /etc/hosts`. Interactive sudo is
-    // expected (macOS will prompt for the user's password). We add a marker line on each side
-    // so future runs / removal is easy to spot.
-    private void writeHostsEntries(List<String> hostnames, Path logFile) throws IOException {
-        String marker = "# cf-docker-cpi (configure-cf-cli)";
-        StringBuilder block = new StringBuilder();
-        block.append('\n').append(marker).append('\n');
-        block.append("127.0.0.1 ").append(String.join(" ", hostnames)).append('\n');
-        block.append("# end cf-docker-cpi\n");
+    private int streamRemote(SetupContext ctx, String script, BufferedWriter logOut)
+            throws IOException, InterruptedException {
+        Process p = startSshBash(ctx);
+        try (var stdin = p.getOutputStream()) {
+            stdin.write(script.getBytes(StandardCharsets.UTF_8));
+        }
+        try (BufferedReader in = new BufferedReader(
+                new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = in.readLine()) != null) {
+                System.out.println(line);
+                logOut.write(line);
+                logOut.newLine();
+                logOut.flush();
+            }
+        }
+        return p.waitFor();
+    }
 
-        ProcessBuilder pb = new ProcessBuilder("sudo", "tee", "-a", "/etc/hosts");
+    private Process startSshBash(SetupContext ctx) throws IOException {
+        ProcessBuilder pb = new ProcessBuilder(
+                "ssh",
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=10",
+                "-o", "ServerAliveInterval=30",
+                "-p", String.valueOf(ctx.target().sshPort()),
+                ctx.target().sshUserHost(),
+                "bash -s");
         pb.redirectErrorStream(true);
-        Process p = pb.start();
-        try (var out = p.getOutputStream()) {
-            out.write(block.toString().getBytes(StandardCharsets.UTF_8));
-        }
-        byte[] resp;
-        try (InputStream in = p.getInputStream()) {
-            resp = in.readAllBytes();
-        }
-        int exit;
-        try {
-            exit = p.waitFor();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("interrupted waiting for sudo tee", e);
-        }
-        if (exit != 0) {
-            throw new IOException("sudo tee -a /etc/hosts exited " + exit + ": "
-                    + new String(resp, StandardCharsets.UTF_8).trim());
-        }
+        return pb.start();
     }
 
     private String readAdminPassword(Path creds) {
@@ -317,34 +311,29 @@ public class ConfigureCfCliStep implements SetupStep {
         return space.find() && CF_SPACE.equals(space.group(1));
     }
 
-    private static boolean containsLineEqualling(String text, String needle) {
-        for (String line : text.split("\\R")) {
-            if (line.trim().equals(needle)) return true;
-        }
-        return false;
-    }
-
     private StepResult failPrecheck(SetupContext ctx, Path logFile, String detail) throws IOException {
         Files.writeString(logFile, "Timestamp: " + Instant.now() + "\n" + detail + "\n");
         statusStore.put(ctx.statusFile(), NAME, StepStatus.fail(detail));
         return StepResult.failed(detail + " (log: " + logFile + ")");
     }
 
-    private void header(BufferedWriter logOut, SetupContext ctx, Path cfBin) throws IOException {
+    private void header(BufferedWriter logOut, SetupContext ctx) throws IOException {
         logOut.write("Timestamp:     " + Instant.now() + "\n");
         logOut.write("Target:        " + ctx.target().uri() + "\n");
-        logOut.write("cf binary:     " + cfBin + "\n");
-        logOut.write("CF_HOME:       " + ctx.cfHome() + "\n");
+        logOut.write("Remote dir:    ~/" + REMOTE_WORK_DIR + "\n");
+        logOut.write("Remote cf:     ~/" + REMOTE_CF_BIN + " (" + ToolingVersions.CF_VERSION + ")\n");
+        logOut.write("Remote CF_HOME: ~/" + REMOTE_CF_HOME + "\n");
         logOut.write("system_domain: " + ctx.systemDomain() + "\n");
         logOut.write("Org/Space:     " + CF_ORG + " / " + CF_SPACE + "\n");
+        logOut.write("--write-hosts: " + ctx.writeHosts() + "\n");
         logOut.write("\n");
         logOut.flush();
     }
 
-    private record CfResult(int exit, String stdout) {}
-
-    private static final class StepFailure extends Exception {
-        final String detail;
-        StepFailure(String detail) { super(detail); this.detail = detail; }
+    // Bash single-quote escape: ' -> '\''
+    private static String escapeSingleQuoted(String s) {
+        return s.replace("'", "'\\''");
     }
+
+    private record CapturedRun(int exit, String output) {}
 }

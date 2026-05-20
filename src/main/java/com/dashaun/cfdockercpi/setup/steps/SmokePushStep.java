@@ -1,6 +1,5 @@
 package com.dashaun.cfdockercpi.setup.steps;
 
-import com.dashaun.cfdockercpi.docker.SshLocalForward;
 import com.dashaun.cfdockercpi.setup.SetupContext;
 import com.dashaun.cfdockercpi.setup.SetupStep;
 import com.dashaun.cfdockercpi.setup.StatusStore;
@@ -9,10 +8,6 @@ import com.dashaun.cfdockercpi.setup.StepResult;
 import com.dashaun.cfdockercpi.setup.StepStatus;
 import org.springframework.stereotype.Component;
 
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLParameters;
-import javax.net.ssl.TrustManager;
-import javax.net.ssl.X509TrustManager;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -20,28 +15,30 @@ import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.SecureRandom;
-import java.security.cert.X509Certificate;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
 import java.util.Optional;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
+// Builds a tiny Spring Boot app locally (the laptop has mvnw + JDK; the docker host usually
+// doesn't), scp's the jar to the docker host, and drives `cf push` + the HTTP probe from
+// there — same docker-host-side architecture as configure-cf-cli (issue #20).
 @Component
 public class SmokePushStep implements SetupStep {
 
     static final String NAME = "smoke-push";
     static final String APP_NAME = "cf-smoke";
     static final String APP_DIR = "cf-smoke";
+    static final String REMOTE_WORK_DIR = ConfigureCfCliStep.REMOTE_WORK_DIR;
+    static final String REMOTE_CF_BIN = ConfigureCfCliStep.REMOTE_CF_BIN;
+    static final String REMOTE_CF_HOME = ConfigureCfCliStep.REMOTE_CF_HOME;
+    static final String REMOTE_JAR = REMOTE_WORK_DIR + "/cf-smoke.jar";
+    static final String REMOTE_MANIFEST = REMOTE_WORK_DIR + "/cf-smoke-manifest.yml";
     static final String STARTER_URL =
             "https://start.spring.io/starter.zip"
                     + "?type=maven-project"
@@ -68,7 +65,8 @@ public class SmokePushStep implements SetupStep {
 
     @Override
     public String description() {
-        return "Fetch a Spring Boot starter, package it, `cf push` it, verify HTTP 200 on /actuator/health.";
+        return "Build a Spring Boot starter locally, scp the jar to the docker host, "
+                + "`cf push` it from the host, then HTTP 200-probe `/actuator/health`.";
     }
 
     @Override
@@ -82,34 +80,28 @@ public class SmokePushStep implements SetupStep {
         if (recorded.isEmpty() || recorded.get().status() != StepStatus.Status.PASS) {
             return StepCheck.NEEDS_RUN;
         }
-        if (ctx.verify()) {
-            return StepCheck.NEEDS_RUN;
-        }
+        if (ctx.verify()) return StepCheck.NEEDS_RUN;
         return StepCheck.ALREADY_DONE;
     }
 
     @Override
     public StepResult run(SetupContext ctx) throws IOException, InterruptedException {
         if (!ctx.target().isSsh()) {
-            return StepResult.failed("smoke-push v1 supports ssh:// targets only; got " + ctx.target().uri());
+            return StepResult.failed("smoke-push v2 supports ssh:// targets only; got " + ctx.target().uri());
         }
         Path logFile = ctx.newLogFile(NAME);
         Files.createDirectories(logFile.getParent());
 
-        Path cfBin = ctx.binDir().resolve("cf");
-        if (!Files.isRegularFile(cfBin) || !Files.isExecutable(cfBin)) {
-            return failPrecheck(ctx, logFile, "cf binary missing at " + cfBin + " — run install-tools");
-        }
-        if (!Files.isDirectory(ctx.cfHome())) {
-            return failPrecheck(ctx, logFile, "CF_HOME missing at " + ctx.cfHome()
-                    + " — run configure-cf-cli");
-        }
-
         Path appDir = ctx.stateDir().resolve(APP_DIR);
-        try (BufferedWriter logOut = Files.newBufferedWriter(logFile)) {
-            header(logOut, ctx, cfBin, appDir);
+        String userHost = ctx.target().sshUserHost();
+        int sshPort = ctx.target().sshPort();
+        String routeHost = APP_NAME + "." + ctx.systemDomain();
+        String healthUrl = "https://" + routeHost + HEALTH_PATH;
 
-            // 1. Fetch starter.zip if pom.xml not already present.
+        try (BufferedWriter logOut = Files.newBufferedWriter(logFile)) {
+            header(logOut, ctx, appDir, routeHost);
+
+            // 1. Fetch the starter (idempotent — keeps existing pom.xml).
             if (!Files.isRegularFile(appDir.resolve("pom.xml"))) {
                 logOut.write("[fetch] " + STARTER_URL + "\n");
                 logOut.flush();
@@ -119,67 +111,77 @@ public class SmokePushStep implements SetupStep {
                 logOut.flush();
             }
 
-            // 2. Write manifest.yml (every run — JBP config + memory may drift).
-            Path manifest = appDir.resolve("manifest.yml");
-            Files.writeString(manifest, manifestYaml());
-            logOut.write("[manifest] wrote " + manifest + "\n\n");
-            logOut.flush();
-
-            // 3. Build the jar.
-            logOut.write("[build] ./mvnw package -DskipTests\n");
+            // 2. Build with the starter's bundled mvnw (JDK on the laptop, not the host).
+            logOut.write("\n[build] ./mvnw package -DskipTests\n");
             logOut.flush();
             int mvnExit = streamCommand(appDir, Map.of(), logOut,
                     appDir.resolve("mvnw").toString(), "package", "-DskipTests");
             if (mvnExit != 0) {
-                throw new StepFailure("./mvnw package failed (exit " + mvnExit + ")");
+                return failRun(ctx, logFile, "./mvnw package failed (exit " + mvnExit + ")");
             }
             Path jar = findJar(appDir.resolve("target"));
             if (jar == null) {
-                throw new StepFailure("build succeeded but no cf-smoke-*.jar found under "
+                return failRun(ctx, logFile, "build succeeded but no cf-smoke-*.jar under "
                         + appDir.resolve("target"));
             }
             logOut.write("[build] " + jar.getFileName() + "\n\n");
             logOut.flush();
 
-            // 4. Open SSH tunnel for cf push + health probe.
-            String routeHost = APP_NAME + "." + ctx.systemDomain();
-            try (SshLocalForward fwd = SshLocalForward.open(ctx.target(),
-                    ConfigureCfCliStep.HAPROXY_VM_IP,
-                    ConfigureCfCliStep.HAPROXY_PORT,
-                    ConfigureCfCliStep.PREFERRED_LOCAL_PORT,
-                    Duration.ofSeconds(10))) {
-                logOut.write("Tunnel:    " + fwd.description() + "\n\n");
-                logOut.flush();
+            // 3. scp the jar to the docker host.
+            logOut.write("[scp] " + jar.getFileName() + " -> " + userHost + ":~/" + REMOTE_JAR + "\n");
+            logOut.flush();
+            scpTo(userHost, sshPort, jar, REMOTE_JAR);
 
-                int pushExit = streamCommand(appDir,
-                        Map.of("CF_HOME", ctx.cfHome().toString(), "CF_COLOR", "false"),
-                        logOut,
-                        cfBin.toString(), "push", APP_NAME,
-                        "-f", manifest.toString(),
-                        "-p", jar.toString());
-                if (pushExit != 0) {
-                    throw new StepFailure("cf push failed (exit " + pushExit + ")");
-                }
-
-                String healthUrl = "https://" + routeHost + ":" + fwd.localPort() + HEALTH_PATH;
-                logOut.write("[probe] GET " + healthUrl + " (up to " + HEALTH_TIMEOUT_SECONDS + "s)\n");
-                logOut.flush();
-                int status = pollFor200(healthUrl, Duration.ofSeconds(HEALTH_TIMEOUT_SECONDS), logOut);
-                if (status != 200) {
-                    throw new StepFailure("GET " + healthUrl + " never returned 200 (last=" + status + ")");
-                }
-                logOut.write("[probe] 200 OK\n");
-                logOut.flush();
-
-                String summary = APP_NAME + " up @ https://" + routeHost
-                        + ":" + fwd.localPort() + HEALTH_PATH;
-                statusStore.put(ctx.statusFile(), NAME, StepStatus.pass(summary));
-                return StepResult.ran(summary + " (log: " + logFile + ")");
+            // 4. Run cf push + curl probe via a single bash blob on the host.
+            String script = pushAndProbeScript(healthUrl);
+            int exit = streamRemote(ctx, script, logOut);
+            if (exit != 0) {
+                return failRun(ctx, logFile, "cf push / probe failed on the docker host (ssh exit " + exit + ")");
             }
-        } catch (StepFailure e) {
-            statusStore.put(ctx.statusFile(), NAME, StepStatus.fail(e.detail));
-            return StepResult.failed(e.detail + " (log: " + logFile + ")");
         }
+
+        String summary = APP_NAME + " up at " + healthUrl;
+        statusStore.put(ctx.statusFile(), NAME, StepStatus.pass(summary));
+        return StepResult.ran(summary + " (log: " + logFile + ")");
+    }
+
+    private String pushAndProbeScript(String healthUrl) {
+        return "set -euo pipefail\n"
+            + "cd ~/" + REMOTE_WORK_DIR + "\n"
+            + "if ! [ -x ./bin/cf ]; then\n"
+            + "  echo \"ERROR: ~/" + REMOTE_CF_BIN + " missing — run configure-cf-cli\"; exit 78\n"
+            + "fi\n"
+            + "if ! [ -d cf-home ]; then\n"
+            + "  echo \"ERROR: ~/" + REMOTE_CF_HOME + " missing — run configure-cf-cli\"; exit 78\n"
+            + "fi\n"
+            + "\n"
+            + "cat > " + manifestBaseName() + " <<'MANIFEST'\n"
+            + manifestYaml()
+            + "MANIFEST\n"
+            + "\n"
+            + "export CF_HOME=\"$(pwd)/cf-home\" CF_COLOR=false\n"
+            + "echo \"[cf] push " + APP_NAME + "\"\n"
+            + "./bin/cf push " + APP_NAME + " -f " + manifestBaseName() + " -p cf-smoke.jar\n"
+            + "\n"
+            + "echo \"[probe] GET " + healthUrl + " (up to " + HEALTH_TIMEOUT_SECONDS + "s)\"\n"
+            + "deadline=$(( $(date +%s) + " + HEALTH_TIMEOUT_SECONDS + " ))\n"
+            + "attempt=0\n"
+            + "while :; do\n"
+            + "  attempt=$((attempt + 1))\n"
+            + "  code=$(curl -sk -o /tmp/cf-smoke-health.json -w '%{http_code}' --max-time 5 '"
+                    + healthUrl + "' || echo 000)\n"
+            + "  if [ \"$code\" = '200' ]; then\n"
+            + "    body=$(cat /tmp/cf-smoke-health.json)\n"
+            + "    echo \"[probe] attempt $attempt: 200 OK — body: $body\"\n"
+            + "    exit 0\n"
+            + "  fi\n"
+            + "  echo \"[probe] attempt $attempt: HTTP $code\"\n"
+            + "  if [ \"$(date +%s)\" -ge \"$deadline\" ]; then\n"
+            + "    echo \"ERROR: " + healthUrl + " never returned 200 (last=$code)\"\n"
+            + "    exit 1\n"
+            + "  fi\n"
+            + "  sleep 3\n"
+            + "done\n";
     }
 
     private void fetchStarter(Path appDir) throws IOException {
@@ -197,9 +199,11 @@ public class SmokePushStep implements SetupStep {
         try (ZipInputStream zin = new ZipInputStream(c.getInputStream())) {
             ZipEntry e;
             while ((e = zin.getNextEntry()) != null) {
-                // start.spring.io zips entries under a top-level "cf-smoke/" folder; strip it.
-                String name = stripTopLevel(e.getName());
-                if (name.isEmpty()) continue;
+                // start.spring.io zips entries flat (no top-level project dir wrapping them
+                // — pom.xml, mvnw, src/main/..., .mvn/wrapper/... are at the root). Write
+                // them under appDir directly.
+                String name = e.getName();
+                if (name.isEmpty() || name.equals("/")) continue;
                 Path dest = appDir.resolve(name).normalize();
                 if (!dest.startsWith(appDir)) {
                     throw new IOException("zip entry escaped target dir: " + e.getName());
@@ -209,18 +213,12 @@ public class SmokePushStep implements SetupStep {
                 } else {
                     Files.createDirectories(dest.getParent());
                     Files.copy(zin, dest);
-                    if (name.equals("mvnw") || name.startsWith("mvnw")) {
+                    if (name.equals("mvnw")) {
                         dest.toFile().setExecutable(true, false);
                     }
                 }
             }
         }
-    }
-
-    private static String stripTopLevel(String entryName) {
-        int slash = entryName.indexOf('/');
-        if (slash < 0) return "";
-        return entryName.substring(slash + 1);
     }
 
     private String manifestYaml() {
@@ -230,8 +228,16 @@ public class SmokePushStep implements SetupStep {
             + "- name: " + APP_NAME + "\n"
             + "  memory: 1G\n"
             + "  instances: 1\n"
+            + "  path: cf-smoke.jar\n"
             + "  env:\n"
             + "    JBP_CONFIG_OPEN_JDK_JRE: '" + JBP_OPEN_JDK + "'\n";
+    }
+
+    private static String manifestBaseName() {
+        // We write the manifest inside the remote work dir; cf reads from CWD, so a bare name
+        // is enough. Kept a distinct file name (vs `manifest.yml`) to avoid colliding with
+        // anything else under ~/.cf-docker-cpi-work/.
+        return REMOTE_MANIFEST.substring(REMOTE_MANIFEST.indexOf('/') + 1);
     }
 
     private Path findJar(Path targetDir) throws IOException {
@@ -239,12 +245,30 @@ public class SmokePushStep implements SetupStep {
         try (DirectoryStream<Path> s = Files.newDirectoryStream(targetDir, "cf-smoke-*.jar")) {
             for (Path p : s) {
                 String n = p.getFileName().toString();
-                // Skip the *-sources or *-original variants if present.
                 if (n.endsWith("-sources.jar") || n.endsWith(".original")) continue;
                 return p;
             }
         }
         return null;
+    }
+
+    private void scpTo(String userHost, int sshPort, Path local, String remotePath)
+            throws IOException, InterruptedException {
+        ProcessBuilder pb = new ProcessBuilder(
+                "scp",
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=10",
+                "-P", String.valueOf(sshPort),
+                local.toString(),
+                userHost + ":" + remotePath);
+        pb.redirectErrorStream(true);
+        Process p = pb.start();
+        byte[] out = p.getInputStream().readAllBytes();
+        int exit = p.waitFor();
+        if (exit != 0) {
+            throw new IOException("scp " + local + " -> " + userHost + ":" + remotePath
+                    + " failed (exit " + exit + "): " + new String(out, StandardCharsets.UTF_8).trim());
+        }
     }
 
     private int streamCommand(Path workdir, Map<String, String> env, BufferedWriter logOut, String... cmd)
@@ -268,89 +292,47 @@ public class SmokePushStep implements SetupStep {
         return p.waitFor();
     }
 
-    // Polls the route until we see 200 (app is up) or the timeout elapses. We expect a brief
-    // window after `cf push` returns where the route is registered but the app is still
-    // starting up. 503 / connection refused / SSLException are all treated as "still booting".
-    private int pollFor200(String url, Duration timeout, BufferedWriter logOut)
+    private int streamRemote(SetupContext ctx, String script, BufferedWriter logOut)
             throws IOException, InterruptedException {
-        HttpClient client = trustAllClient();
-        HttpRequest req = HttpRequest.newBuilder(URI.create(url))
-                .timeout(Duration.ofSeconds(5))
-                .GET()
-                .build();
-        Instant deadline = Instant.now().plus(timeout);
-        int lastStatus = -1;
-        int attempt = 0;
-        while (Instant.now().isBefore(deadline)) {
-            attempt++;
-            try {
-                HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
-                lastStatus = resp.statusCode();
-                if (lastStatus == 200) {
-                    logOut.write("[probe] attempt " + attempt + ": 200 OK (body: "
-                            + truncate(resp.body(), 120) + ")\n");
-                    logOut.flush();
-                    return 200;
-                }
-                logOut.write("[probe] attempt " + attempt + ": HTTP " + lastStatus + "\n");
+        ProcessBuilder pb = new ProcessBuilder(
+                "ssh",
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=10",
+                "-o", "ServerAliveInterval=30",
+                "-p", String.valueOf(ctx.target().sshPort()),
+                ctx.target().sshUserHost(),
+                "bash -s");
+        pb.redirectErrorStream(true);
+        Process p = pb.start();
+        try (var stdin = p.getOutputStream()) {
+            stdin.write(script.getBytes(StandardCharsets.UTF_8));
+        }
+        try (BufferedReader in = new BufferedReader(
+                new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = in.readLine()) != null) {
+                System.out.println(line);
+                logOut.write(line);
+                logOut.newLine();
                 logOut.flush();
-            } catch (IOException | InterruptedException e) {
-                logOut.write("[probe] attempt " + attempt + ": " + e.getClass().getSimpleName()
-                        + ": " + e.getMessage() + "\n");
-                logOut.flush();
-                if (e instanceof InterruptedException) throw e;
             }
-            Thread.sleep(3000);
         }
-        return lastStatus;
+        return p.waitFor();
     }
 
-    private static HttpClient trustAllClient() {
-        try {
-            SSLContext ssl = SSLContext.getInstance("TLS");
-            ssl.init(null, new TrustManager[]{new X509TrustManager() {
-                @Override public void checkClientTrusted(X509Certificate[] chain, String authType) {}
-                @Override public void checkServerTrusted(X509Certificate[] chain, String authType) {}
-                @Override public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
-            }}, new SecureRandom());
-            // Some JDKs hostname-verify even with a trust-all TM; clear endpoint identification.
-            SSLParameters params = new SSLParameters();
-            params.setEndpointIdentificationAlgorithm(null);
-            return HttpClient.newBuilder()
-                    .sslContext(ssl)
-                    .sslParameters(params)
-                    .connectTimeout(Duration.ofSeconds(5))
-                    .build();
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    private static String truncate(String s, int max) {
-        if (s == null) return "";
-        s = s.replace('\n', ' ').replace('\r', ' ');
-        return s.length() <= max ? s : s.substring(0, max) + "...";
-    }
-
-    private StepResult failPrecheck(SetupContext ctx, Path logFile, String detail) throws IOException {
-        Files.writeString(logFile, "Timestamp: " + Instant.now() + "\n" + detail + "\n");
+    private StepResult failRun(SetupContext ctx, Path logFile, String detail) throws IOException {
         statusStore.put(ctx.statusFile(), NAME, StepStatus.fail(detail));
         return StepResult.failed(detail + " (log: " + logFile + ")");
     }
 
-    private void header(BufferedWriter logOut, SetupContext ctx, Path cfBin, Path appDir) throws IOException {
-        logOut.write("Timestamp:     " + Instant.now() + "\n");
-        logOut.write("Target:        " + ctx.target().uri() + "\n");
-        logOut.write("cf binary:     " + cfBin + "\n");
-        logOut.write("CF_HOME:       " + ctx.cfHome() + "\n");
-        logOut.write("App dir:       " + appDir + "\n");
-        logOut.write("Route:         " + APP_NAME + "." + ctx.systemDomain() + "\n");
+    private void header(BufferedWriter logOut, SetupContext ctx, Path appDir, String routeHost) throws IOException {
+        logOut.write("Timestamp:    " + Instant.now() + "\n");
+        logOut.write("Target:       " + ctx.target().uri() + "\n");
+        logOut.write("Local appdir: " + appDir + "\n");
+        logOut.write("Remote dir:   ~/" + REMOTE_WORK_DIR + "\n");
+        logOut.write("Remote jar:   ~/" + REMOTE_JAR + "\n");
+        logOut.write("Route:        " + routeHost + "\n");
         logOut.write("\n");
         logOut.flush();
-    }
-
-    private static final class StepFailure extends Exception {
-        final String detail;
-        StepFailure(String detail) { super(detail); this.detail = detail; }
     }
 }
