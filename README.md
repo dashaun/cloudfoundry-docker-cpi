@@ -4,9 +4,19 @@ A Spring Shell 4 CLI for setting up CloudFoundry (OSS) on x86_64/amd64 Linux hos
 
 Built with Spring Boot 4 + Spring Shell 4. Requires Java 17.
 
+## Repo layout
+
+Multi-module Maven build:
+
+```
+pom.xml         ← parent (packaging=pom)
+cli/            ← Spring Shell CLI
+broker/         ← (planned) Spring Cloud Open Service Broker app for the optional marketplace
+```
+
 ## Quickstart
 
-Build:
+Build (all modules):
 
 ```bash
 ./mvnw clean package
@@ -15,7 +25,7 @@ Build:
 Interactive shell (recommended):
 
 ```bash
-java -jar target/cf-docker-cpi-0.1.0-SNAPSHOT.jar
+java -jar cli/target/cf-docker-cpi-0.1.0-SNAPSHOT.jar
 # at the prompt:
 docker verify --host ssh://user@host
 ```
@@ -24,7 +34,7 @@ One-shot / scripting mode:
 
 ```bash
 java -Dspring.shell.interactive.enabled=false \
-  -jar target/cf-docker-cpi-0.1.0-SNAPSHOT.jar \
+  -jar cli/target/cf-docker-cpi-0.1.0-SNAPSHOT.jar \
   docker verify --host ssh://user@host
 ```
 
