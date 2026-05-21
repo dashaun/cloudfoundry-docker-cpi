@@ -11,9 +11,11 @@ import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
 /**
- * Phase 1 stub: log the request, return success, do nothing else. Phase 2 will replace this
- * with a real implementation that translates each {@code create / delete} into a
- * {@code docker run} / {@code docker rm -f} against the host dockerd.
+ * Fallback used when {@link com.dashaun.cfdockercpi.broker.docker.ContainerProvisioner} isn't
+ * available (no {@code docker.host} configured — e.g. running the broker on a laptop for
+ * UI/contract checks). Logs the operation, returns success, doesn't actually provision
+ * anything. When ContainerProvisioner IS available,
+ * {@link ContainerProvisionedInstanceService} ({@code @Primary}) shadows this bean.
  */
 @Service
 public class StubServiceInstanceService implements ServiceInstanceService {

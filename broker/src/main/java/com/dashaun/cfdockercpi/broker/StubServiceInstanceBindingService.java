@@ -14,9 +14,10 @@ import reactor.core.publisher.Mono;
 import java.util.Map;
 
 /**
- * Phase 1 stub: log the request, return a placeholder credential set. Phase 2 will replace
- * this with real per-binding credentials minted against the underlying docker container
- * (e.g. a new postgres role + password, scoped to this binding).
+ * Fallback used when {@link com.dashaun.cfdockercpi.broker.docker.ContainerProvisioner} isn't
+ * available. Returns a placeholder credentials map so the OSB protocol round-trip works for
+ * smoke tests; the real binding credentials come from
+ * {@link ContainerProvisionedBindingService} ({@code @Primary}) when dockerd is configured.
  */
 @Service
 public class StubServiceInstanceBindingService implements ServiceInstanceBindingService {
