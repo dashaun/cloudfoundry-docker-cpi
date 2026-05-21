@@ -165,7 +165,7 @@ public class BrokerDeployer {
             + "applications:\n"
             + "- name: " + CF_APP_NAME + "\n"
             + "  path: " + brokerJarBaseName() + "\n"
-            + "  memory: 512M\n"
+            + "  memory: 1G\n"
             + "  instances: 1\n"
             + "  buildpacks: [java_buildpack]\n"
             + "  env:\n"
