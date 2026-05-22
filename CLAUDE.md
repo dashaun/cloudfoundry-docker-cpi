@@ -8,20 +8,32 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Stack: Spring Boot 4.0.6, Spring Shell 4.0.2, docker-java 3.5.1, Java 17.
 
+## Repo layout
+
+Multi-module Maven build:
+
+```
+pom.xml                      ← parent (packaging=pom), version + dependencyManagement
+cli/pom.xml                  ← Spring Shell CLI (artifactId: cf-docker-cpi)
+cli/src/                     ← all existing Java + tests
+```
+
+The marketplace broker module (`broker/`) is a planned future addition; not in main yet.
+
 ## Build & run
 
 ```bash
-./mvnw clean package                          # build fat jar to target/cf-docker-cpi-0.1.0-SNAPSHOT.jar
+./mvnw clean package                          # builds all modules; CLI jar at cli/target/cf-docker-cpi-0.1.0-SNAPSHOT.jar
 ./mvnw test                                   # unit tests
-./mvnw -Dtest=ClassName#method test           # single test
+./mvnw -pl cli -Dtest=ClassName#method test   # single test
 
 # Interactive shell (default, JLine-backed)
-java -jar target/cf-docker-cpi-0.1.0-SNAPSHOT.jar
+java -jar cli/target/cf-docker-cpi-0.1.0-SNAPSHOT.jar
 # then at the prompt:  docker verify --host ssh://user@host
 
 # One-shot / scripting mode
 java -Dspring.shell.interactive.enabled=false \
-  -jar target/cf-docker-cpi-0.1.0-SNAPSHOT.jar \
+  -jar cli/target/cf-docker-cpi-0.1.0-SNAPSHOT.jar \
   docker verify --host ssh://user@host
 ```
 
@@ -75,6 +87,6 @@ The release source is materialised inline in `UpdateRuntimeConfigStep.java` (no 
 
 ## Layout
 
-- `com.dashaun.cfdockercpi.commands` — Spring Shell command classes.
-- `com.dashaun.cfdockercpi.docker` — target resolution, SSH tunnel, docker-java client factory, verification checks and result types.
-- `src/main/resources/application.properties` — silences Spring banner / startup info, sets logging levels, enables interactive mode by default.
+- `cli/src/main/java/com/dashaun/cfdockercpi/commands` — Spring Shell command classes.
+- `cli/src/main/java/com/dashaun/cfdockercpi/docker` — target resolution, SSH tunnel, docker-java client factory, verification checks and result types.
+- `cli/src/main/resources/application.properties` — silences Spring banner / startup info, sets logging levels, enables interactive mode by default.

@@ -26,9 +26,19 @@ smoke-push             build a Spring Boot starter locally, scp + cf push, probe
 
 Per-step reference (inputs, outputs, cheap/deep checks, failure modes) is in [docs/setup-pipeline.md](docs/setup-pipeline.md). Architectural notes (resumable orchestrator, SSH transport, state directory) are in [docs/architecture.md](docs/architecture.md). For a guided walk-through, open the presentation at [docs/index.html](docs/index.html) (any static server — `jwebserver -d "$(pwd)/docs" -p 8000`).
 
+## Repo layout
+
+Multi-module Maven build:
+
+```
+pom.xml         ← parent (packaging=pom)
+cli/            ← Spring Shell CLI
+broker/         ← (planned) Spring Cloud Open Service Broker app for the optional marketplace
+```
+
 ## Quickstart
 
-Build:
+Build (all modules):
 
 ```bash
 ./mvnw clean package
@@ -38,7 +48,7 @@ One-shot mode (recommended for the pipeline):
 
 ```bash
 java -Dspring.shell.interactive.enabled=false \
-  -jar target/cf-docker-cpi-0.1.0-SNAPSHOT.jar \
+  -jar cli/target/cf-docker-cpi-0.1.0-SNAPSHOT.jar \
   setup step --name verify-docker --host ssh://user@host
 ```
 
@@ -47,7 +57,7 @@ Then run each subsequent step the same way (`--name host-setup`, `--name install
 Interactive shell:
 
 ```bash
-java -jar target/cf-docker-cpi-0.1.0-SNAPSHOT.jar
+java -jar cli/target/cf-docker-cpi-0.1.0-SNAPSHOT.jar
 # at the prompt:
 setup status --host ssh://user@host
 setup step --name verify-docker --host ssh://user@host
