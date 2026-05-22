@@ -83,18 +83,17 @@ Write `director-vars.yml` with director IP, internal CIDR, and the runtime docke
   - Container resource limits insufficient → bosh CLI emits a clear error.
   - CPI can't reach docker → check `tls/` on the host and dockerd's TLS config (below).
   - Bootstrap exits 78 with `tls/ca.pem missing` → see "dockerd TLS prereq" below.
-  - `dial tcp 10.245.0.11:6868: i/o timeout` from the bosh CLI → on WSL2 docker hosts the `cf-docker-cpi-net` bridge isn't routable from the WSL shell by default. See "WSL2 routing prereq" below.
+  - `No such image: bosh.io/stemcells:img-...` from the bosh CLI on the first `create_vm` call → Docker 29's containerd-snapshotter is enabled and bosh-docker-cpi 0.2.12 can't see images through it. See "WSL2 prereqs" below for the `/etc/docker/daemon.json` fix (applies to any Docker 29 host, not just WSL2).
+  - `dial tcp 10.245.0.11:6868: i/o timeout` from the bosh CLI → almost always Docker Desktop's WSL2 integration hiding the bridge in its helper VM. Switch to native dockerd inside the WSL distro (see README + "WSL2 prereqs" below).
 
-### WSL2 routing prereq
+### WSL2 prereqs
 
-When the docker host is a WSL2 distro on Windows 11, the `cf-docker-cpi-net` bridge (`10.245.0.0/24`) is created inside Docker Desktop's helper VM and not exposed to the WSL2 shell. `bosh create-env` then can't reach `10.245.0.11:6868` to push the rest of the deployment. The fix is to enable WSL's mirrored networking mode on the Windows side (one-time host config; see the README's "WSL2 docker host notes" for the exact `.wslconfig` snippet and `wsl --shutdown` recipe). Verify on the docker host with:
+WSL2 has its own set of caveats, all captured in the README's "WSL2 docker host notes". Quick reference relevant to `deploy-director`:
 
-```bash
-ip route show | grep -E '10\.245|cf-docker'   # should print a route after the docker network is created
-nc -w3 -zv 10.245.0.11 6868                   # should connect once the director container is up
-```
-
-If you can't enable mirrored networking, this CLI doesn't currently have a workaround — see issue #13 for the rejected sidecar-container alternative.
+- **Native dockerd, not Docker Desktop.** bosh-docker-cpi requires TLS-on-TCP to dockerd, and Docker Desktop's integration doesn't expose that out of the box. `sudo apt install docker.io` inside the WSL2 distro after disabling Docker Desktop's WSL2 integration for that distro.
+- **`/etc/docker/daemon.json` with `{"storage-driver": "overlay2"}`** before applying the dockerd TLS recipe below. Without it, Docker 29's containerd-snapshotter (enabled by default) makes `create_stemcell` invisible to the CPI's `create_vm` and the deploy fails with `No such image: bosh.io/stemcells:img-...`.
+- **Mirrored networking is _not_ required** when using native dockerd inside the WSL2 distro (the supported setup). The `cf-docker-cpi-net` bridge lives in the distro's own network namespace and is locally routable. Mirrored networking was needed only in the older Docker-Desktop-integration scenario captured in issue #13; that path is no longer supported.
+- **Known limitation: `cf push` doesn't reach the finish line on stock WSL2** because Microsoft's WSL2 kernel ships without `CONFIG_SECURITYFS`, which garden-runc requires for per-container AppArmor/keyring isolation. The pipeline runs cleanly through `update-runtime-config`; the diego-cell canary in `deploy-cf` fails on `mount: /sys/kernel/security: mount point does not exist`. Tracked in issue #22. Workaround is a custom WSL2 kernel build with `CONFIG_SECURITYFS=y` etc.
 
 ### dockerd TLS prereq
 

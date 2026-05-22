@@ -34,30 +34,49 @@ java -Dspring.shell.interactive.enabled=false \
 
 ## WSL2 docker host notes
 
-When the docker host is a WSL2 distro on Windows 11, the cf-deployment bridge (`10.245.0.0/24`) lives inside Docker Desktop's helper VM and is **not** routable from the WSL2 shell by default. `deploy-director` will fail at:
+### Known limitation: garden-runc needs `securityfs`
 
-```
-Post "https://mbus:<redacted>@10.245.0.11:6868/agent": dial tcp 10.245.0.11:6868: i/o timeout
-```
-
-Fix once, on the Windows side, by enabling [mirrored networking](https://learn.microsoft.com/en-us/windows/wsl/networking#mirrored-mode-networking):
-
-1. Edit (or create) `C:\Users\<you>\.wslconfig`:
-   ```ini
-   [wsl2]
-   networkingMode=mirrored
-   ```
-2. From PowerShell (admin): `wsl --shutdown`
-3. Re-open the WSL distro / re-SSH to the host.
-
-Verify on the docker host:
+The full pipeline runs cleanly on WSL2 through `update-runtime-config` (10 of 13 steps) but **`deploy-cf` fails at the diego-cell canary** because garden-runc tries to mount `/sys/kernel/security` inside each container it creates. Microsoft's stock WSL2 kernel ships **without `CONFIG_SECURITYFS`**:
 
 ```bash
-ip route show | grep -E '10\.245|cf-docker'   # should print a route
-nc -w3 -zv 10.245.0.11 6868                   # should connect once the director is up
+$ zcat /proc/config.gz | grep SECURITY
+# CONFIG_SECURITYFS is not set
+# CONFIG_SECURITY_NETWORK is not set
+# CONFIG_SECURITY_APPARMOR is not set
+
+$ ls /sys/kernel/security/lsm
+ls: cannot access '/sys/kernel/security/lsm': No such file or directory
 ```
 
-Requires Windows 11 22H2+ and a recent Docker Desktop. If you can't enable mirrored networking (older Windows, group-policy restrictions), the alternative is to run `bosh create-env` from a sidecar container colocated on `cf-docker-cpi-net` — not currently supported by this CLI.
+So `cf push` is unreachable on stock WSL2. The only known path forward is to build a [custom WSL2 kernel](https://learn.microsoft.com/en-us/windows/wsl/wsl-config#kernel) from [microsoft/WSL2-Linux-Kernel](https://github.com/microsoft/WSL2-Linux-Kernel) with `CONFIG_SECURITYFS=y`, `CONFIG_SECURITY_APPARMOR=y`, and `CONFIG_SECURITY_NETWORK=y`, then point `.wslconfig` `kernel=` at the resulting `bzImage`. Tracked in issue #22; not supported by this CLI today.
+
+If you don't need a working CF deploy and just want to validate the early pipeline steps (verify-docker through update-runtime-config), WSL2 with native dockerd is fine.
+
+### Docker Desktop is not supported
+
+Use **native dockerd installed inside the WSL2 distro** (`sudo apt install docker.io` after disabling Docker Desktop's WSL2 integration). bosh-docker-cpi 0.2.12's CPI requires TLS-on-TCP to dockerd; Docker Desktop doesn't expose a TLS-on-TCP endpoint out of the box, and the manual dockerd recipe in `docs/setup-pipeline.md §6` only applies when dockerd is a systemd unit you control.
+
+### Docker 29 needs `daemon.json` to disable the containerd snapshotter
+
+`apt install docker.io` on Ubuntu noble lands Docker 29.x, which enables the containerd snapshotter by default. bosh-docker-cpi 0.2.12's `create_stemcell` loads stemcell images but they aren't visible to the CPI's subsequent `docker create` call — the deploy then fails on `No such image: bosh.io/stemcells:img-...`. Fix before running `deploy-director`:
+
+```bash
+echo '{"storage-driver": "overlay2"}' | sudo tee /etc/docker/daemon.json
+sudo systemctl restart docker
+# verify: `docker info` should show `Storage Driver: overlay2` and dockerd logs
+# should show `containerd-snapshotter=false`.
+```
+
+### Mirrored networking — only with Docker Desktop integration
+
+Prior versions of this doc said WSL2 needs `.wslconfig` `networkingMode=mirrored` to make the `cf-docker-cpi-net` bridge routable from the WSL shell. That's true **only when Docker Desktop is in the picture** — Docker Desktop's helper VM hides the bridge. With native dockerd inside the distro (the supported setup), the bridge is created in the WSL distro's own network namespace and is locally routable; no `.wslconfig` change required. If you do happen to be debugging a Docker-Desktop-era setup:
+
+```ini
+[wsl2]
+networkingMode=mirrored
+```
+
+then `wsl --shutdown` from PowerShell.
 
 ## Roadmap
 
